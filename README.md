@@ -15,6 +15,10 @@
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License: MIT">
 </p>
 
+<p align="center">
+  <img src="docs/screenshots/flow_bar_recording.gif" alt="LocalFlow Flow Bar" width="260" style="border-radius: 12px;">
+</p>
+
 ---
 
 ## Highlights
@@ -28,6 +32,10 @@
 - **Bilingual Support**: Full interface and prompt support for **English** and **Russian**.
 - **Dark, Light & System Themes**: Clean modern aesthetic with automatic Windows accent and theme detection.
 - **Insights & Vocabulary**: Personal dictionary for technical terms/replacements, dictation history with search, and usage analytics.
+
+<p align="center">
+  <img src="docs/screenshots/flow_bar_showcase.png" alt="LocalFlow Flow Bar Modes" width="700">
+</p>
 
 ---
 
@@ -66,6 +74,31 @@ LocalFlow detects your active foreground window and selects the ideal formatting
 | `mail_docs` | Outlook, Word, Notion, Obsidian | Structured paragraphs and bullet points. |
 | `browser_query` | Chrome, Edge, Firefox | Concise search queries without conversational fluff. |
 | `raw` | Any configured app | Direct Whisper transcript without LLM post-processing. |
+
+---
+
+## Interface & Configuration
+
+### Settings & LLM Engine
+Configure your performance profile, choose between embedded `llama.cpp` (with Vulkan GPU / CPU) or Ollama, manage hotkeys, UI themes, and audio feedback:
+
+<p align="center">
+  <img src="docs/screenshots/settings_window.png" alt="LocalFlow Settings & Model Configuration" width="780">
+</p>
+
+### App-Aware Style & Prompt Editor
+Customize instructions per application and refine the base prompt:
+
+<p align="center">
+  <img src="docs/screenshots/style_and_prompt.png" alt="App-Aware Style & Prompt Configuration" width="780">
+</p>
+
+### History & Usage Analytics
+Review past transcripts, search dictation logs, and monitor productivity metrics:
+
+<p align="center">
+  <img src="docs/screenshots/insights_window.png" alt="LocalFlow History & Usage Analytics" width="780">
+</p>
 
 ---
 
