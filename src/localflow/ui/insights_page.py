@@ -86,11 +86,11 @@ class _ArcGaugeWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         is_light = self._theme == "light"
 
-        stroke = 10.0
-        diam = min(self.width() - stroke * 2 - 12.0, (self.height() - stroke) * 1.72)
-        diam = max(72.0, diam)
+        stroke = 8.0
+        diam = min(self.width() - stroke * 2 - 16.0, 96.0)
+        diam = max(70.0, diam)
         x = (self.width() - diam) / 2.0
-        y = 10.0
+        y = 6.0
         arc_rect = QRectF(x, y, diam, diam)
 
         # Background track (200-degree wide semi-arc)
@@ -108,24 +108,23 @@ class _ArcGaugeWidget(QWidget):
             p.drawArc(arc_rect, 190 * 16, int(-200 * ratio * 16))
 
         # Center labels
-        center_y = y + diam * 0.44
         if self._wpm > 0:
             p.setPen(QColor("#63636e") if is_light else QColor("#a1a1aa"))
-            p.setFont(QFont("Segoe UI", 8.5, QFont.Weight.Medium))
-            p.drawText(QRectF(x, center_y - 14, diam, 18), Qt.AlignmentFlag.AlignCenter, "Top")
+            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Medium))
+            p.drawText(QRectF(x, y + diam * 0.20, diam, 15), Qt.AlignmentFlag.AlignCenter, "Top")
 
             p.setPen(QColor("#111113") if is_light else QColor("#fafafa"))
             p.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
             p.drawText(
-                QRectF(x, center_y + 4, diam, 22),
+                QRectF(x, y + diam * 0.38, diam, 22),
                 Qt.AlignmentFlag.AlignCenter,
                 f"{self._top_percent}%",
             )
         else:
             p.setPen(QColor("#71717a"))
-            p.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
+            p.setFont(QFont("Segoe UI", 8.5, QFont.Weight.Medium))
             p.drawText(
-                QRectF(x, center_y - 4, diam, 22),
+                QRectF(x, y + diam * 0.28, diam, 20),
                 Qt.AlignmentFlag.AlignCenter,
                 tr("insights.no_data", self._lang),
             )
