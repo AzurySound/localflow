@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds thin standalone LocalFlow release artifacts (LocalFlow-Setup-0.2.0.exe + portable.zip).
+    Builds thin standalone LocalFlow release artifacts (LocalFlow-Setup-<version>.exe + portable.zip).
 .EXAMPLE
     .\packaging\build_release.ps1
     .\packaging\build_release.ps1 -SkipTests

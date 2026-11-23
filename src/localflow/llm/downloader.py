@@ -12,6 +12,7 @@ import zipfile
 import httpx
 
 from localflow.i18n import tr
+from localflow import __version__
 from localflow.llm.model_catalog import (
     EmbeddedModelSpec,
     find_llama_server_binary,
@@ -59,7 +60,7 @@ def download_file(
     part_path = dest_path.with_name(dest_path.name + ".part")
 
     existing = part_path.stat().st_size if part_path.is_file() else 0
-    headers = {"User-Agent": "LocalFlow/0.2.0"}
+    headers = {"User-Agent": f"LocalFlow/{__version__}"}
     if existing > 0:
         headers["Range"] = f"bytes={existing}-"
 
@@ -192,7 +193,7 @@ def download_llama_runtime(
         if on_progress is not None:
             on_progress(DownloadProgress(stage=tr("dl.stage_search_llama", lang), downloaded_bytes=0, total_bytes=0))
 
-        gh_headers = {"User-Agent": "LocalFlow/0.2.0", "Accept": "application/vnd.github+json"}
+        gh_headers = {"User-Agent": f"LocalFlow/{__version__}", "Accept": "application/vnd.github+json"}
         picked: tuple[str, str] | None = None
 
         rel_resp = http.get(LLAMA_CPP_LATEST_RELEASE_API, headers=gh_headers)
@@ -411,7 +412,7 @@ def download_whisper_model(
     )
     try:
         api_url = f"https://huggingface.co/api/models/{repo_id}?blobs=true"
-        resp = http.get(api_url, headers={"User-Agent": "LocalFlow/0.2.0"})
+        resp = http.get(api_url, headers={"User-Agent": f"LocalFlow/{__version__}"})
         resp.raise_for_status()
         meta = resp.json()
         siblings = meta.get("siblings") if isinstance(meta, dict) else None

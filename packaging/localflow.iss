@@ -1,6 +1,6 @@
 ; Inno Setup 6 script for LocalFlow thin standalone installer (per-user, no UAC admin prompt)
 #define MyAppName "LocalFlow"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.2.1"
 #define MyAppPublisher "LocalFlow"
 #define MyAppExeName "LocalFlow.exe"
 
