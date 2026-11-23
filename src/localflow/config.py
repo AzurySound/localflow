@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -138,11 +139,53 @@ def is_builtin_llm_prompt(text: str) -> bool:
     )
 
 
-def get_app_data_dir() -> Path:
-    """Return %APPDATA%\\LocalFlow (or ~/.local/share/LocalFlow as fallback)."""
+PORTABLE_MARKER_FILENAME = "portable.flag"
+
+
+def _get_frozen_exe_dir() -> Path | None:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return None
+
+
+def is_portable_mode(exe_dir: Path | None = None) -> bool:
+    """Return True when running from a Portable bundle (portable.flag or local data/ folder)."""
+    env_flag = (os.environ.get("LOCALFLOW_PORTABLE") or "").strip().lower()
+    if env_flag in ("1", "true", "yes"):
+        return True
+    if env_flag in ("0", "false", "no"):
+        return False
+    base = exe_dir if exe_dir is not None else _get_frozen_exe_dir()
+    if base is None:
+        return False
+    return (base / PORTABLE_MARKER_FILENAME).is_file() or (base / "data").is_dir()
+
+
+def get_app_data_dir(exe_dir: Path | None = None) -> Path:
+    """Return the active data directory (<exe_dir>\\data in portable mode, else %APPDATA%\\LocalFlow)."""
+    override = (os.environ.get("LOCALFLOW_DATA_DIR") or "").strip()
+    if override:
+        path = Path(override)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    base_exe = exe_dir if exe_dir is not None else _get_frozen_exe_dir()
+    if base_exe is not None and is_portable_mode(base_exe):
+        path = base_exe / "data"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     appdata = os.environ.get("APPDATA")
     base = Path(appdata) if appdata else Path.home() / ".local" / "share"
     path = base / "LocalFlow"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_whisper_models_dir(base_dir: Path | None = None) -> Path:
+    """Return directory where Whisper models are stored locally."""
+    root = base_dir or get_app_data_dir()
+    path = root / "models" / "whisper"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -246,6 +289,12 @@ class AppConfig(BaseModel):
     )
     style_custom_instructions: dict[str, str] = Field(default_factory=dict)
     messenger_strip_trailing_period: bool = True
+
+    # History Retention & Deletion Mode
+    history_hard_delete: bool = False
+    history_auto_delete_enabled: bool = False
+    history_auto_delete_value: int = Field(default=7, ge=1, le=36500)
+    history_auto_delete_unit: Literal["minutes", "hours", "days"] = "days"
 
 
 def apply_performance_profile(

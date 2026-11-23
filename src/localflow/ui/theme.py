@@ -149,8 +149,9 @@ _DARK_TOKENS: dict[str, str] = {
     "list_sel_bg": "#29292e",
     "list_sel_border": "#46464f",
     "list_sel_fg": "#ffffff",
-    "scroll_handle": "#303036",
-    "scroll_hover": "#46464f",
+    "scroll_track": "#141417",
+    "scroll_handle": "#52525b",
+    "scroll_hover": "#71717a",
     "msgbox_bg": "#18181b",
 }
 
@@ -214,8 +215,9 @@ _LIGHT_TOKENS: dict[str, str] = {
     "list_sel_bg": "#e8e8f0",
     "list_sel_border": "#a1a1aa",
     "list_sel_fg": "#111113",
-    "scroll_handle": "#d1d1d8",
-    "scroll_hover": "#a1a1aa",
+    "scroll_track": "#e8e8ee",
+    "scroll_handle": "#a1a1aa",
+    "scroll_hover": "#71717a",
     "msgbox_bg": "#ffffff",
 }
 
@@ -505,33 +507,50 @@ QScrollArea {{
     background: transparent;
 }}
 QScrollBar:vertical {{
-    background: transparent;
-    width: 7px;
+    background: {t["scroll_track"]};
+    width: 8px;
     margin: 2px;
+    border-radius: 4px;
 }}
 QScrollBar::handle:vertical {{
     background: {t["scroll_handle"]};
-    border-radius: 3px;
-    min-height: 24px;
+    border-radius: 4px;
+    min-height: 28px;
 }}
 QScrollBar::handle:vertical:hover {{
     background: {t["scroll_hover"]};
 }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0px;
+    background: none;
+    border: none;
+}}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+    background: transparent;
+    border: none;
 }}
 QScrollBar:horizontal {{
-    background: transparent;
-    height: 7px;
+    background: {t["scroll_track"]};
+    height: 8px;
     margin: 2px;
+    border-radius: 4px;
 }}
 QScrollBar::handle:horizontal {{
     background: {t["scroll_handle"]};
-    border-radius: 3px;
-    min-width: 24px;
+    border-radius: 4px;
+    min-width: 28px;
+}}
+QScrollBar::handle:horizontal:hover {{
+    background: {t["scroll_hover"]};
 }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
     width: 0px;
+    background: none;
+    border: none;
+}}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+    background: transparent;
+    border: none;
 }}
 """
 

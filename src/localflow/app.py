@@ -18,6 +18,7 @@ from localflow.config import (
     AppConfig,
     apply_performance_profile,
     get_app_data_dir,
+    is_portable_mode,
     load_config,
     save_config,
 )
@@ -25,6 +26,11 @@ from localflow.hotkey.capslock_hook import GlobalHotkeyListener
 from localflow.i18n import LanguageCode, normalize_language, tr
 from localflow.injector.win32_paste import Win32TextInjector
 from localflow.injector.window_context import ActiveWindowContext, get_active_window_context
+from localflow.llm.downloader import (
+    DownloadProgress,
+    find_local_whisper_model_path,
+    get_whisper_model_dir,
+)
 from localflow.llm.embedded_polisher import EmbeddedLlamaPolisher
 from localflow.llm.ollama_polisher import OllamaPolisher
 from localflow.storage import HistoryStorage
@@ -74,6 +80,7 @@ class LocalFlowController(QObject):
 
     _asr_loaded = Signal(int, object)
     _asr_failed = Signal(int, str)
+    _asr_download_progress = Signal(int, object)  # gen, DownloadProgress
     _stage_polishing = Signal(str)
     _stage_injecting = Signal()
     _pipeline_done = Signal(bool, str, str)  # llm_fallback_needed, llm_err, final_text
@@ -100,6 +107,8 @@ class LocalFlowController(QObject):
         self._shutting_down = False
         self._asr_status_kind = "loading"
         self._asr_status_obj: ASRStatus | None = None
+        self._asr_downloading = False
+        self._asr_download_pct = -1
         self._asr_status_text = tr("menu.asr_loading_model", self._lang, model=self._config.whisper_model)
         recent = self._storage.list_recent(limit=1)
         self._last_dictation_text: str = recent[0].final_text if recent else ""
@@ -108,6 +117,11 @@ class LocalFlowController(QObject):
         self._snooze_timer = QTimer(self)
         self._snooze_timer.setSingleShot(True)
         self._snooze_timer.timeout.connect(self._on_unsnooze)
+
+        self._history_cleanup_timer = QTimer(self)
+        self._history_cleanup_timer.setInterval(60_000)
+        self._history_cleanup_timer.timeout.connect(self._run_history_auto_cleanup)
+        self._history_cleanup_timer.start()
 
         self._recorder = AudioRecorder()
         self._injector = Win32TextInjector()
@@ -141,6 +155,7 @@ class LocalFlowController(QObject):
         self._hotkey = GlobalHotkeyListener(threshold_ms=self._config.double_tap_ms)
 
         self._connect_signals()
+        self._run_history_auto_cleanup()
         self._tray.show()
         self._restore_pill_idle()
         self._hotkey.start()
@@ -149,7 +164,6 @@ class LocalFlowController(QObject):
         if not self._config.first_run_completed:
             self._config = self._config.model_copy(update={"first_run_completed": True})
             save_config(self._config)
-            QTimer.singleShot(300, self._open_first_run_setup)
 
     def show_hub(self) -> None:
         """Bring the Hub/Settings window to the foreground (also called on second instance launch)."""
@@ -248,6 +262,9 @@ class LocalFlowController(QObject):
 
         self._asr_loaded.connect(self._on_asr_loaded)
         self._asr_failed.connect(self._on_asr_failed)
+        self._asr_download_progress.connect(
+            self._on_asr_download_progress, Qt.ConnectionType.QueuedConnection
+        )
         self._stage_polishing.connect(self._on_stage_polishing)
         self._stage_injecting.connect(self._on_stage_injecting)
         self._pipeline_done.connect(self._on_pipeline_done)
@@ -276,46 +293,146 @@ class LocalFlowController(QObject):
         self._pill.toggle_requested.connect(self._on_toggle)
         self._pill.cancel_requested.connect(self._on_cancel)
         self._pill.copy_last_requested.connect(self._on_copy_last_dictation)
+        self._pill.download_clicked.connect(self._open_first_run_setup)
         self._pill.context_menu_requested.connect(self._on_pill_context_menu)
 
         self._settings.config_saved.connect(self._on_config_saved)
+        self._settings.history_retention_changed.connect(self._on_history_retention_changed)
         self._settings.reset_pill_position_requested.connect(self._on_reset_pill_position)
         self._settings.theme_preview_requested.connect(self._on_theme_preview)
         self._settings.language_preview_requested.connect(self._on_language_preview)
+        self._settings.llm_download_progress_changed.connect(self._on_llm_download_progress)
+        self._settings.llm_download_ended.connect(self._on_llm_download_ended)
         try:
             self._app.styleHints().colorSchemeChanged.connect(self._on_system_theme_changed)
         except Exception:
             pass
 
+    def _on_history_retention_changed(self, cfg: AppConfig) -> None:
+        self._config = self._config.model_copy(
+            update={
+                "history_auto_delete_enabled": cfg.history_auto_delete_enabled,
+                "history_auto_delete_value": cfg.history_auto_delete_value,
+                "history_auto_delete_unit": cfg.history_auto_delete_unit,
+                "history_hard_delete": cfg.history_hard_delete,
+            }
+        )
+        self._run_history_auto_cleanup()
+
+    def _run_history_auto_cleanup(self) -> None:
+        if not self._config.history_auto_delete_enabled:
+            return
+        try:
+            removed = self._storage.apply_auto_cleanup(
+                enabled=self._config.history_auto_delete_enabled,
+                value=self._config.history_auto_delete_value,
+                unit=self._config.history_auto_delete_unit,
+                hard=self._config.history_hard_delete,
+            )
+            if removed > 0 and self._settings.isVisible():
+                self._settings.refresh_history()
+                if self._config.history_hard_delete:
+                    self._settings.refresh_insights()
+        except Exception:
+            logger.exception("Failed to run automatic history cleanup")
+
     def _load_asr_async(self) -> None:
         self._asr_load_gen += 1
         gen = self._asr_load_gen
         asr_ref = self._asr
+        model_name = self._config.whisper_model
+        dl_lang = self._lang
         self._asr_status_kind = "loading"
         self._asr_status_obj = None
         self._refresh_asr_status_label()
 
+        needs_download = find_local_whisper_model_path(model_name) is None
+        if needs_download:
+            self._asr_downloading = True
+            self._asr_download_pct = 0
+            dest_dir = get_whisper_model_dir(model_name)
+            label = f"Whisper {model_name}"
+            self._pill.show_downloading(label, 0)
+            self._settings.set_external_download_progress(
+                label,
+                DownloadProgress(stage=label, downloaded_bytes=0, total_bytes=0),
+                dest_dir,
+            )
+            try:
+                msg_key = (
+                    "onboarding.tray_whisper_portable"
+                    if is_portable_mode()
+                    else "onboarding.tray_whisper_installed"
+                )
+                self._tray.showMessage(
+                    tr("onboarding.tray_title", dl_lang),
+                    tr(msg_key, dl_lang, model=model_name, path=str(get_app_data_dir())),
+                    self._tray.MessageIcon.Information,
+                    6000,
+                )
+            except Exception:
+                pass
+        else:
+            self._asr_downloading = False
+            self._asr_download_pct = -1
+
         def _work() -> None:
             try:
-                status = asr_ref.load()
+                try:
+                    status = asr_ref.load(
+                        on_progress=lambda prog: self._asr_download_progress.emit(gen, prog),
+                        lang=dl_lang,
+                    )
+                except TypeError:
+                    status = asr_ref.load()
                 self._asr_loaded.emit(gen, status)
             except Exception as exc:
                 self._asr_failed.emit(gen, str(exc))
 
         self._pool.start(_FnWorker(_work))
 
+    def _on_asr_download_progress(self, gen: int, progress: object) -> None:
+        if gen != self._asr_load_gen or not isinstance(progress, DownloadProgress):
+            return
+        self._asr_downloading = True
+        pct = progress.percent if progress.total_bytes > 0 else -1
+        self._asr_download_pct = pct
+        label = f"Whisper {self._config.whisper_model}"
+        self._settings.set_external_download_progress(
+            label, progress, get_whisper_model_dir(self._config.whisper_model)
+        )
+        if self._state == AppState.IDLE:
+            self._pill.show_downloading(label, pct)
+
+    def _on_llm_download_progress(self, label: str, percent: int) -> None:
+        if self._state == AppState.IDLE and not self._asr_downloading:
+            self._pill.show_downloading(label, percent)
+
+    def _on_llm_download_ended(self) -> None:
+        if self._state == AppState.IDLE and not self._asr_downloading:
+            self._restore_pill_idle()
+
     def _on_asr_loaded(self, gen: int, status: ASRStatus) -> None:
         if gen != self._asr_load_gen:
             return
+        was_downloading = self._asr_downloading
+        self._asr_downloading = False
+        self._asr_download_pct = -1
+        self._settings.clear_external_download()
         self._asr_status_kind = "ready"
         self._asr_status_obj = status
         self._refresh_asr_status_label()
+        if was_downloading and self._state == AppState.IDLE:
+            self._pill.show_notice(tr("onboarding.pill_ready", self._lang), duration_ms=3000)
         if self._config.llm_enabled and self._config.ollama_warmup_on_start:
             self._pool.start(_FnWorker(self._polisher.warmup))
 
     def _on_asr_failed(self, gen: int, err: str) -> None:
         if gen != self._asr_load_gen:
             return
+        self._asr_downloading = False
+        self._asr_download_pct = -1
+        self._settings.clear_external_download()
         self._asr_status_kind = "error"
         self._asr_status_obj = None
         self._refresh_asr_status_label()
@@ -389,9 +506,14 @@ class LocalFlowController(QObject):
         if self._state != AppState.IDLE:
             return
         if not self._asr.status.ready:
-            self._pill.show_notice(
-                tr("notice.model_loading", self._lang), is_error=True, duration_ms=1800
-            )
+            if self._asr_downloading:
+                self._pill.show_downloading(
+                    f"Whisper {self._config.whisper_model}", self._asr_download_pct
+                )
+            else:
+                self._pill.show_notice(
+                    tr("notice.model_loading", self._lang), is_error=True, duration_ms=1800
+                )
             return
 
         window_ctx = self._safe_get_active_window_context()
@@ -459,9 +581,14 @@ class LocalFlowController(QObject):
 
     def _start_recording(self) -> None:
         if not self._asr.status.ready:
-            self._pill.show_notice(
-                tr("notice.model_loading", self._lang), is_error=True, duration_ms=1800
-            )
+            if self._asr_downloading:
+                self._pill.show_downloading(
+                    f"Whisper {self._config.whisper_model}", self._asr_download_pct
+                )
+            else:
+                self._pill.show_notice(
+                    tr("notice.model_loading", self._lang), is_error=True, duration_ms=1800
+                )
             return
 
         window_ctx = self._safe_get_active_window_context()
@@ -708,6 +835,7 @@ class LocalFlowController(QObject):
 
     def _on_pipeline_done(self, llm_fallback: bool, llm_err: str, final_text: str) -> None:
         self._set_state(AppState.IDLE)
+        self._run_history_auto_cleanup()
         if final_text:
             self._last_dictation_text = final_text
             self._tray.set_last_dictation_preview(final_text)

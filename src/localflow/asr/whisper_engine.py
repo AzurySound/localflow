@@ -113,10 +113,27 @@ class WhisperEngine:
             error=self._last_error,
         )
 
-    def load(self) -> ASRStatus:
-        """Load and warm up the Whisper model into memory (called once in a background thread)."""
+    def load(
+        self,
+        *,
+        on_progress=None,
+        cancel_event: threading.Event | None = None,
+        lang: str | None = None,
+    ) -> ASRStatus:
+        """Load and warm up the Whisper model into memory (downloading into local data dir if needed)."""
         _register_cuda_dll_directories()
         from faster_whisper import WhisperModel
+        from localflow.llm.downloader import download_whisper_model, find_local_whisper_model_path
+
+        local_dir = find_local_whisper_model_path(self.model_name)
+        if local_dir is None:
+            local_dir = download_whisper_model(
+                self.model_name,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+                lang=lang,
+            )
+        model_source = str(local_dir)
 
         with self._lock:
             candidates: list[tuple[str, str]]
@@ -134,7 +151,12 @@ class WhisperEngine:
 
             for dev, ct in candidates:
                 try:
-                    model = WhisperModel(self.model_name, device=dev, compute_type=ct)
+                    model = WhisperModel(
+                        model_source,
+                        device=dev,
+                        compute_type=ct,
+                        local_files_only=True,
+                    )
                     # Run warm-up inference so missing cublas/cudnn DLLs fail here and fall back cleanly
                     list(model.transcribe(warmup_audio, beam_size=1, vad_filter=False)[0])
                     self._model = model

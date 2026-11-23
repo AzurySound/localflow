@@ -41,8 +41,11 @@ from localflow.config import (
     AppConfig,
     DEFAULT_LLM_SYSTEM_PROMPT,
     apply_performance_profile,
+    get_app_data_dir,
     get_default_llm_prompt,
     is_builtin_llm_prompt,
+    is_portable_mode,
+    save_config,
 )
 from localflow.i18n import (
     DEFAULT_LANGUAGE,
@@ -137,7 +140,15 @@ def _build_window_icon() -> QIcon:
 
 
 class _DropdownCombo(QComboBox):
-    """QComboBox with a crisp anti-aliased vector chevron indicator on the right."""
+    """QComboBox with a crisp anti-aliased vector chevron indicator and disabled wheel scrolling."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        # Let wheel events bubble up to the parent QScrollArea instead of changing combo selection
+        event.ignore()
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         super().paintEvent(event)
@@ -161,6 +172,28 @@ class _DropdownCombo(QComboBox):
         cy = float(self.height()) / 2.0 + 1.0
         p.drawLine(QPointF(cx - 3.6, cy - 2.2), QPointF(cx, cy + 1.6))
         p.drawLine(QPointF(cx, cy + 1.6), QPointF(cx + 3.6, cy - 2.2))
+
+
+class _NoWheelSpinBox(QSpinBox):
+    """QSpinBox that ignores mouse wheel so scrolling the Settings page never mutates values."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
+
+
+class _NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that ignores mouse wheel so scrolling the Settings page never mutates values."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
 
 
 class _FlowLogoGlyph(QWidget):
@@ -194,6 +227,9 @@ class SettingsWindow(QWidget):
     reset_pill_position_requested = Signal()
     theme_preview_requested = Signal(str)
     language_preview_requested = Signal(str)
+    history_retention_changed = Signal(AppConfig)
+    llm_download_progress_changed = Signal(str, int)  # label, percent (-1 indeterminate)
+    llm_download_ended = Signal()
     _models_loaded = Signal(list)
     _models_failed = Signal(str)
     _download_progress = Signal(object)
@@ -216,6 +252,8 @@ class SettingsWindow(QWidget):
         self._editing_style_key: str = "messenger_alive"
         self._download_cancel_event: threading.Event | None = None
         self._download_active = False
+        self._download_label_short = ""
+        self._active_dl_dest: Path | None = None
         self._models_loaded.connect(self._on_models_loaded)
         self._models_failed.connect(self._on_models_failed)
         self._download_progress.connect(self._on_download_progress)
@@ -330,6 +368,10 @@ class SettingsWindow(QWidget):
             ],
         )
         self._repopulate_data_combo(self._theme_combo, get_theme_choice_items(new_lang))
+        self._repopulate_data_combo(
+            self._auto_delete_unit_combo,
+            self._get_auto_delete_unit_items(new_lang),
+        )
 
         style_items = get_style_choice_items(new_lang)
         for combo in self._cat_style_combos.values():
@@ -514,7 +556,7 @@ class SettingsWindow(QWidget):
         )
 
     def refresh_insights(self) -> None:
-        self._insights_tab.refresh(self._storage.list_all())
+        self._insights_tab.refresh(self._storage.list_all(include_deleted=True))
 
     def _update_status_card(self, cfg: AppConfig) -> None:
         is_light = self._resolved_theme == "light"
@@ -551,9 +593,10 @@ class SettingsWindow(QWidget):
 
         # Left/center column: feed
         feed = QWidget()
+        feed.setMinimumWidth(370)
         layout = QVBoxLayout(feed)
-        layout.setContentsMargins(24, 20, 20, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 20, 16, 18)
+        layout.setSpacing(10)
 
         header = QHBoxLayout()
         title = QLabel(tr("history.title", self._lang))
@@ -612,10 +655,60 @@ class SettingsWindow(QWidget):
         self._history_search.setPlaceholderText(tr("history.search_placeholder", self._lang))
         self._bind_placeholder(self._history_search, "history.search_placeholder")
         self._history_search.setClearButtonEnabled(True)
-        self._history_search.setFixedWidth(185)
+        self._history_search.setMinimumWidth(96)
+        self._history_search.setMaximumWidth(185)
         self._history_search.textChanged.connect(self._apply_history_filter)
         filter_row.addWidget(self._history_search)
         layout.addLayout(filter_row)
+
+        # Auto-delete rule (Minutes / Hours / Days) + Soft/Hard delete toggle (stacked cleanly for narrow windows)
+        retention_box = QVBoxLayout()
+        retention_box.setContentsMargins(0, 0, 0, 0)
+        retention_box.setSpacing(6)
+
+        retention_row = QHBoxLayout()
+        retention_row.setContentsMargins(0, 0, 0, 0)
+        retention_row.setSpacing(8)
+        self._auto_delete_check = QCheckBox(tr("history.auto_delete_check", self._lang))
+        self._auto_delete_check.setChecked(self._config.history_auto_delete_enabled)
+        self._bind_text(self._auto_delete_check, "history.auto_delete_check")
+        self._auto_delete_check.toggled.connect(self._on_history_retention_controls_changed)
+        retention_row.addWidget(self._auto_delete_check)
+
+        self._auto_delete_spin = _NoWheelSpinBox()
+        self._auto_delete_spin.setRange(1, 36500)
+        self._auto_delete_spin.setFixedWidth(68)
+        self._auto_delete_spin.setValue(self._config.history_auto_delete_value)
+        self._auto_delete_spin.valueChanged.connect(self._on_history_retention_controls_changed)
+        retention_row.addWidget(self._auto_delete_spin)
+
+        self._auto_delete_unit_combo = _DropdownCombo()
+        self._auto_delete_unit_combo.setFixedWidth(104)
+        for lbl, key in self._get_auto_delete_unit_items(self._lang):
+            self._auto_delete_unit_combo.addItem(lbl, key)
+        u_idx = self._auto_delete_unit_combo.findData(self._config.history_auto_delete_unit)
+        self._auto_delete_unit_combo.setCurrentIndex(u_idx if u_idx >= 0 else 2)
+        self._auto_delete_unit_combo.currentIndexChanged.connect(
+            self._on_history_retention_controls_changed
+        )
+        retention_row.addWidget(self._auto_delete_unit_combo)
+        retention_row.addStretch()
+        retention_box.addLayout(retention_row)
+
+        hard_row = QHBoxLayout()
+        hard_row.setContentsMargins(0, 0, 0, 0)
+        hard_row.setSpacing(8)
+        self._hard_delete_check = QCheckBox(tr("history.hard_delete_check", self._lang))
+        self._hard_delete_check.setChecked(self._config.history_hard_delete)
+        self._hard_delete_check.setToolTip(tr("history.hard_delete_tooltip", self._lang))
+        self._bind_text(self._hard_delete_check, "history.hard_delete_check")
+        self._bind_tooltip(self._hard_delete_check, "history.hard_delete_tooltip")
+        self._hard_delete_check.toggled.connect(self._on_history_retention_controls_changed)
+        hard_row.addWidget(self._hard_delete_check)
+        hard_row.addStretch()
+        retention_box.addLayout(hard_row)
+
+        layout.addLayout(retention_box)
 
         divider = QFrame()
         divider.setObjectName("divider")
@@ -647,7 +740,8 @@ class SettingsWindow(QWidget):
         # Right inspector panel (matching Wispr Flow right column)
         inspector = QFrame()
         inspector.setObjectName("inspectorPane")
-        inspector.setFixedWidth(268)
+        inspector.setMinimumWidth(185)
+        inspector.setMaximumWidth(268)
         ins_layout = QVBoxLayout(inspector)
         ins_layout.setContentsMargins(18, 22, 18, 18)
         ins_layout.setSpacing(10)
@@ -687,6 +781,68 @@ class SettingsWindow(QWidget):
         root.addWidget(inspector)
         return w
 
+    @staticmethod
+    def _get_auto_delete_unit_items(lang: str | None = None) -> list[tuple[str, str]]:
+        return [
+            (tr("history.unit_minutes", lang), "minutes"),
+            (tr("history.unit_hours", lang), "hours"),
+            (tr("history.unit_days", lang), "days"),
+        ]
+
+    def _confirm_auto_delete_enable(self, count: int, *, hard: bool = False) -> bool:
+        info_key = (
+            "history.confirm_delete_info_hard"
+            if hard
+            else "history.confirm_delete_info_soft"
+        )
+        return self._confirm_delete_dialog(
+            tr("history.confirm_autodelete_title", self._lang),
+            tr("history.confirm_autodelete_text", self._lang, count=count),
+            tr(info_key, self._lang),
+            tr("history.delete", self._lang),
+        )
+
+    def _on_history_retention_controls_changed(self, *_args) -> None:
+        was_enabled = self._config.history_auto_delete_enabled
+        enabled = self._auto_delete_check.isChecked()
+        val = int(self._auto_delete_spin.value())
+        unit = str(self._auto_delete_unit_combo.currentData() or "days")
+        if unit not in ("minutes", "hours", "days"):
+            unit = "days"
+        hard = self._hard_delete_check.isChecked()
+
+        # When turning auto-delete ON, warn if existing records will be deleted immediately
+        if enabled and not was_enabled:
+            pending = self._storage.count_auto_cleanup(
+                enabled=True,
+                value=val,
+                unit=unit,
+                hard=hard,
+            )
+            if pending > 0 and not self._confirm_auto_delete_enable(pending, hard=hard):
+                self._auto_delete_check.blockSignals(True)
+                self._auto_delete_check.setChecked(False)
+                self._auto_delete_check.blockSignals(False)
+                return
+
+        self._config = self._config.model_copy(
+            update={
+                "history_auto_delete_enabled": enabled,
+                "history_auto_delete_value": val,
+                "history_auto_delete_unit": unit,  # type: ignore[typeddict-item]
+                "history_hard_delete": hard,
+            }
+        )
+        try:
+            save_config(self._config)
+        except Exception:
+            pass
+        self.history_retention_changed.emit(self._config)
+        if enabled:
+            self.refresh_history()
+            if self._config.history_hard_delete:
+                self.refresh_insights()
+
     def _set_history_filter_mode(self, mode: str) -> None:
         self._history_filter_mode = mode
         self._apply_history_filter(self._history_search.text())
@@ -698,6 +854,15 @@ class SettingsWindow(QWidget):
         )
 
     def refresh_history(self) -> None:
+        if self._config.history_auto_delete_enabled:
+            removed = self._storage.apply_auto_cleanup(
+                enabled=self._config.history_auto_delete_enabled,
+                value=self._config.history_auto_delete_value,
+                unit=self._config.history_auto_delete_unit,
+                hard=self._config.history_hard_delete,
+            )
+            if removed > 0 and self._config.history_hard_delete:
+                self.refresh_insights()
         self._history_entries = self._storage.list_recent(limit=200)
         self._clear_history_btn.setEnabled(bool(self._history_entries))
         self._update_history_stats_label()
@@ -852,16 +1017,22 @@ class SettingsWindow(QWidget):
         box.exec()
         return box.clickedButton() is confirm_btn
 
-    def _confirm_delete_entries(self, count: int) -> bool:
+    def _confirm_delete_entries(self, count: int, *, hard: bool | None = None) -> bool:
+        use_hard = self._hard_delete_check.isChecked() if hard is None else bool(hard)
         text = (
             tr("history.confirm_delete_one", self._lang)
             if count == 1
             else tr("history.confirm_delete_many", self._lang, count=count)
         )
+        info_key = (
+            "history.confirm_delete_info_hard"
+            if use_hard
+            else "history.confirm_delete_info_soft"
+        )
         return self._confirm_delete_dialog(
             tr("history.confirm_delete_title", self._lang),
             text,
-            tr("history.confirm_delete_info", self._lang),
+            tr(info_key, self._lang),
             tr("history.delete", self._lang),
         )
 
@@ -871,30 +1042,42 @@ class SettingsWindow(QWidget):
             return
         rows = sorted(self._history_list.row(item) for item in selected)
         entry_ids = [item.data(Qt.ItemDataRole.UserRole).id for item in selected]
+        hard = self._hard_delete_check.isChecked()
         if not self._confirm_delete_entries(len(entry_ids)):
             return
-        self._storage.delete_entries(entry_ids)
+        self._storage.delete_entries(entry_ids, hard=hard)
         self.refresh_history()
         self.refresh_insights()
         if self._history_list.count() > 0:
             target_row = min(rows[0], self._history_list.count() - 1)
             self._history_list.setCurrentRow(target_row)
 
-    def _confirm_clear_history(self, count: int) -> bool:
+    def _confirm_clear_history(self, count: int, *, hard: bool | None = None) -> bool:
+        use_hard = self._hard_delete_check.isChecked() if hard is None else bool(hard)
+        info_key = (
+            "history.confirm_clear_info_hard"
+            if use_hard
+            else "history.confirm_clear_info_soft"
+        )
         return self._confirm_delete_dialog(
             tr("history.confirm_clear_title", self._lang),
             tr("history.confirm_clear_text", self._lang, count=count),
-            tr("history.confirm_clear_info", self._lang),
+            tr(info_key, self._lang),
             tr("history.clear", self._lang),
         )
 
     def _clear_history(self) -> None:
-        count = len(self._history_entries) or len(self._storage.list_all())
+        hard = self._hard_delete_check.isChecked()
+        count = len(self._history_entries) or (
+            len(self._storage.list_all(include_deleted=True))
+            if hard
+            else len(self._storage.list_recent(limit=2000))
+        )
         if count == 0:
             return
         if not self._confirm_clear_history(count):
             return
-        self._storage.clear()
+        self._storage.clear(hard=hard)
         self.refresh_history()
         self.refresh_insights()
 
@@ -1158,6 +1341,42 @@ class SettingsWindow(QWidget):
             "settings.subtitle",
         )
 
+        # Card 0: Active Download Status (visible only while Whisper or LLM is downloading)
+        self._active_dl_card, active_dl_form = self._make_section_card("settings.active_dl_hdr")
+        self._active_dl_card.setVisible(False)
+        dl_card_v = QVBoxLayout()
+        dl_card_v.setContentsMargins(0, 0, 0, 0)
+        dl_card_v.setSpacing(6)
+
+        self._active_dl_status_lbl = QLabel("")
+        self._active_dl_status_lbl.setWordWrap(True)
+        dl_card_v.addWidget(self._active_dl_status_lbl)
+
+        self._active_dl_bar = QProgressBar()
+        self._active_dl_bar.setRange(0, 100)
+        self._active_dl_bar.setValue(0)
+        self._active_dl_bar.setTextVisible(False)
+        self._active_dl_bar.setFixedHeight(8)
+        dl_card_v.addWidget(self._active_dl_bar)
+
+        dl_path_row = QHBoxLayout()
+        dl_path_row.setSpacing(8)
+        self._active_dl_path_lbl = QLabel("")
+        self._active_dl_path_lbl.setObjectName("mutedMeta")
+        self._active_dl_path_lbl.setWordWrap(True)
+        dl_path_row.addWidget(self._active_dl_path_lbl, stretch=1)
+
+        self._active_dl_open_btn = QPushButton(tr("settings.open_folder", self._lang))
+        self._active_dl_open_btn.setObjectName("ghostBtn")
+        self._active_dl_open_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._bind_text(self._active_dl_open_btn, "settings.open_folder")
+        self._active_dl_open_btn.clicked.connect(self._open_active_download_folder)
+        dl_path_row.addWidget(self._active_dl_open_btn)
+        dl_card_v.addLayout(dl_path_row)
+
+        active_dl_form.addRow(dl_card_v)
+        cards_layout.addWidget(self._active_dl_card)
+
         # Card 1: Performance & ASR
         perf_card, perf_form = self._make_section_card("settings.perf_hdr")
 
@@ -1211,7 +1430,7 @@ class SettingsWindow(QWidget):
         self._populate_mics()
         self._add_form_row(audio_form, "settings.mic_label", self._mic_combo)
 
-        self._double_tap_spin = QSpinBox()
+        self._double_tap_spin = _NoWheelSpinBox()
         self._double_tap_spin.setRange(150, 800)
         self._double_tap_spin.setSuffix(tr("settings.ms_suffix", self._lang))
         self._double_tap_spin.setFixedWidth(110)
@@ -1223,7 +1442,7 @@ class SettingsWindow(QWidget):
         self._silence_auto_stop_check = QCheckBox(tr("settings.silence_check", self._lang))
         self._silence_auto_stop_check.setChecked(self._config.silence_auto_stop_enabled)
         self._bind_text(self._silence_auto_stop_check, "settings.silence_check")
-        self._silence_auto_stop_spin = QDoubleSpinBox()
+        self._silence_auto_stop_spin = _NoWheelDoubleSpinBox()
         self._silence_auto_stop_spin.setRange(0.5, 15.0)
         self._silence_auto_stop_spin.setSingleStep(0.5)
         self._silence_auto_stop_spin.setDecimals(1)
@@ -1449,6 +1668,31 @@ class SettingsWindow(QWidget):
         ux_form.addRow(self._autostart_check)
         cards_layout.addWidget(ux_card)
 
+        # Card 5: Data & Models Storage Folder
+        storage_card, storage_form = self._make_section_card("settings.storage_hdr")
+        storage_row = QHBoxLayout()
+        storage_row.setSpacing(8)
+        if is_portable_mode():
+            self._portable_badge = QLabel(tr("settings.storage_portable_badge", self._lang))
+            self._portable_badge.setObjectName("profileBadge")
+            self._portable_badge.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            storage_row.addWidget(self._portable_badge)
+        self._storage_path_lbl = QLabel(str(get_app_data_dir()))
+        self._storage_path_lbl.setObjectName("mutedMeta")
+        self._storage_path_lbl.setWordWrap(True)
+        self._storage_path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        storage_row.addWidget(self._storage_path_lbl, stretch=1)
+
+        self._open_storage_btn = QPushButton(tr("settings.open_folder", self._lang))
+        self._open_storage_btn.setObjectName("secondary")
+        self._open_storage_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._open_storage_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._bind_text(self._open_storage_btn, "settings.open_folder")
+        self._open_storage_btn.clicked.connect(lambda: self._open_folder_in_explorer(get_app_data_dir()))
+        storage_row.addWidget(self._open_storage_btn)
+        self._add_form_row(storage_form, "settings.storage_folder_lbl", storage_row)
+        cards_layout.addWidget(storage_card)
+
         cards_layout.addStretch()
         return page
 
@@ -1633,6 +1877,7 @@ class SettingsWindow(QWidget):
         if spec is None:
             return
         self._download_active = True
+        self._download_label_short = spec.name.replace(" (Q4_K_M)", "")
         self._download_cancel_event = threading.Event()
         cancel_ev = self._download_cancel_event
         dl_lang = self._lang
@@ -1640,6 +1885,7 @@ class SettingsWindow(QWidget):
         self._download_box.setVisible(True)
         self._download_bar.setRange(0, 0)  # Indeterminate until size is known
         self._download_status_lbl.setText(tr("settings.dl_preparing", dl_lang, name=spec.name))
+        self.llm_download_progress_changed.emit(self._download_label_short, -1)
         self._on_embedded_model_changed()
 
         def _worker() -> None:
@@ -1687,6 +1933,50 @@ class SettingsWindow(QWidget):
             self._download_cancel_event.set()
             self._download_status_lbl.setText(tr("settings.dl_cancelling", self._lang))
 
+    @staticmethod
+    def _open_folder_in_explorer(folder: Path) -> None:
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            import os
+
+            if hasattr(os, "startfile"):
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    def _open_active_download_folder(self) -> None:
+        target = self._active_dl_dest or get_app_data_dir()
+        self._open_folder_in_explorer(target)
+
+    def set_external_download_progress(
+        self,
+        label: str,
+        progress: DownloadProgress,
+        dest_dir: Path,
+    ) -> None:
+        """Display an active background download (e.g. Whisper model) in the top Settings card."""
+        self._active_dl_dest = dest_dir
+        self._active_dl_card.setVisible(True)
+        self._active_dl_path_lbl.setText(tr("settings.dl_dest_path", self._lang, path=str(dest_dir)))
+        if progress.total_bytes > 0:
+            if self._active_dl_bar.maximum() == 0:
+                self._active_dl_bar.setRange(0, 100)
+            self._active_dl_bar.setValue(progress.percent)
+            dl_mb = progress.downloaded_bytes / (1024 * 1024)
+            tot_mb = progress.total_bytes / (1024 * 1024)
+            spd = f" · {progress.speed_mb_s:.1f} MB/s" if progress.speed_mb_s > 0.05 else ""
+            self._active_dl_status_lbl.setText(
+                f"{label}: {progress.percent}% ({dl_mb:.0f} / {tot_mb:.0f} MB{spd})"
+            )
+        else:
+            self._active_dl_bar.setRange(0, 0)
+            self._active_dl_status_lbl.setText(f"{label}...")
+
+    def clear_external_download(self) -> None:
+        """Hide the top active download card once the background download finishes."""
+        self._active_dl_dest = None
+        self._active_dl_card.setVisible(False)
+
     def _on_download_progress(self, progress: object) -> None:
         if not isinstance(progress, DownloadProgress):
             return
@@ -1700,14 +1990,17 @@ class SettingsWindow(QWidget):
             self._download_status_lbl.setText(
                 f"{progress.stage}: {progress.percent}% ({dl_mb:.0f} / {tot_mb:.0f} MB{spd})"
             )
+            self.llm_download_progress_changed.emit(self._download_label_short, progress.percent)
         else:
             self._download_bar.setRange(0, 0)
             self._download_status_lbl.setText(progress.stage)
+            self.llm_download_progress_changed.emit(self._download_label_short, -1)
 
     def _on_download_finished(self, model_id: str, also_switch_whisper: bool) -> None:
         self._download_active = False
         self._download_cancel_event = None
         self._download_box.setVisible(False)
+        self.llm_download_ended.emit()
         self._refresh_embedded_model_items(select_id=model_id)
         b_idx = self._llm_backend_combo.findData("embedded")
         if b_idx >= 0:
@@ -1729,6 +2022,7 @@ class SettingsWindow(QWidget):
         self._download_active = False
         self._download_cancel_event = None
         self._download_box.setVisible(False)
+        self.llm_download_ended.emit()
         self._on_embedded_model_changed()
         self._save_status.setText(err)
 
@@ -1797,6 +2091,21 @@ class SettingsWindow(QWidget):
         self._silence_auto_stop_check.setChecked(cfg.silence_auto_stop_enabled)
         self._silence_auto_stop_spin.setValue(cfg.silence_auto_stop_sec)
         self._silence_auto_stop_spin.setEnabled(cfg.silence_auto_stop_enabled)
+
+        self._auto_delete_check.blockSignals(True)
+        self._auto_delete_spin.blockSignals(True)
+        self._auto_delete_unit_combo.blockSignals(True)
+        self._hard_delete_check.blockSignals(True)
+        self._auto_delete_check.setChecked(cfg.history_auto_delete_enabled)
+        self._auto_delete_spin.setValue(cfg.history_auto_delete_value)
+        u_idx = self._auto_delete_unit_combo.findData(cfg.history_auto_delete_unit)
+        self._auto_delete_unit_combo.setCurrentIndex(u_idx if u_idx >= 0 else 2)
+        self._hard_delete_check.setChecked(cfg.history_hard_delete)
+        self._auto_delete_check.blockSignals(False)
+        self._auto_delete_spin.blockSignals(False)
+        self._auto_delete_unit_combo.blockSignals(False)
+        self._hard_delete_check.blockSignals(False)
+
         self.apply_theme(cfg.theme)
 
     def _save_clicked(self) -> None:
@@ -1853,6 +2162,12 @@ class SettingsWindow(QWidget):
                 "theme": str(self._theme_combo.currentData() or "system"),
                 "silence_auto_stop_enabled": self._silence_auto_stop_check.isChecked(),
                 "silence_auto_stop_sec": round(self._silence_auto_stop_spin.value(), 1),
+                "history_auto_delete_enabled": self._auto_delete_check.isChecked(),
+                "history_auto_delete_value": int(self._auto_delete_spin.value()),
+                "history_auto_delete_unit": str(
+                    self._auto_delete_unit_combo.currentData() or "days"
+                ),
+                "history_hard_delete": self._hard_delete_check.isChecked(),
             }
         )
         self._config = updated

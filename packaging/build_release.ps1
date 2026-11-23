@@ -64,7 +64,27 @@ New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
 Write-Host "[5/6] Packaging portable ZIP..." -ForegroundColor Yellow
 $PortableZip = Join-Path $ReleaseDir "LocalFlow-$Version-portable.zip"
 if (Test-Path $PortableZip) { Remove-Item $PortableZip -Force }
-Compress-Archive -Path $DistDir -DestinationPath $PortableZip -CompressionLevel Optimal
+$PortableFlag = Join-Path $DistDir "portable.flag"
+Set-Content -Path $PortableFlag -Value "portable" -Encoding ASCII -NoNewline
+try {
+    & $VenvPy -c @"
+import os, sys, zipfile
+
+zip_path = sys.argv[1]
+dist_dir = sys.argv[2]
+parent_dir = os.path.dirname(os.path.abspath(dist_dir))
+
+with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+    for root, _, files in os.walk(dist_dir):
+        for file in files:
+            full_path = os.path.join(root, file)
+            rel_path = os.path.relpath(full_path, parent_dir)
+            zf.write(full_path, rel_path)
+"@ $PortableZip $DistDir
+    if ($LASTEXITCODE -ne 0) { throw "ZIP creation failed." }
+} finally {
+    if (Test-Path $PortableFlag) { Remove-Item $PortableFlag -Force }
+}
 $zipSizeMB = [math]::Round(((Get-Item $PortableZip).Length / 1MB), 1)
 Write-Host "  Created: $PortableZip ($zipSizeMB MB)" -ForegroundColor Green
 

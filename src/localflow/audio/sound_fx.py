@@ -81,7 +81,12 @@ def _get_cached_wav_path(kind: str, data: bytes) -> Path | None:
         if cached is not None and cached.is_file() and cached.stat().st_size == len(data):
             return cached
         try:
-            sound_dir = Path(tempfile.gettempdir()) / "localflow_sounds"
+            from localflow.config import get_app_data_dir, is_portable_mode
+
+            if is_portable_mode():
+                sound_dir = get_app_data_dir() / "cache" / "sounds"
+            else:
+                sound_dir = Path(tempfile.gettempdir()) / "localflow_sounds"
             sound_dir.mkdir(parents=True, exist_ok=True)
             wav_path = sound_dir / f"cue_{kind}_v2.wav"
             if not wav_path.is_file() or wav_path.stat().st_size != len(data):

@@ -49,6 +49,7 @@ class PillMode(str, Enum):
     RECORDING = "recording"
     TRANSCRIBING = "transcribing"
     POLISHING = "polishing"
+    DOWNLOADING = "downloading"
     NOTICE = "notice"
 
 
@@ -59,6 +60,7 @@ class FloatingPillWidget(QWidget):
     toggle_requested = Signal()
     cancel_requested = Signal()
     copy_last_requested = Signal()
+    download_clicked = Signal()
     context_menu_requested = Signal(QPoint)
 
     def __init__(self, initial_pos: tuple[int, int] | None = None) -> None:
@@ -81,6 +83,8 @@ class FloatingPillWidget(QWidget):
         self._processing_label = tr("pill.polishing", self._lang)
         self._notice_text = ""
         self._notice_is_error = False
+        self._download_label = ""
+        self._download_percent = -1
         self._live_preview_enabled = True
         self._preview_text = ""
         self._idle_bar_enabled = False
@@ -445,7 +449,7 @@ class FloatingPillWidget(QWidget):
                 if self._mode == PillMode.IDLE_BAR:
                     anchor_x = pos.x() - (COMPACT_WIDTH - self.width()) // 2
                     anchor_y = pos.y() - (PILL_HEIGHT - self.height())
-                elif self._mode == PillMode.NOTICE:
+                elif self._mode == PillMode.NOTICE or self._mode == PillMode.DOWNLOADING:
                     anchor_x = pos.x() - (COMPACT_WIDTH - self.width()) // 2
                     anchor_y = pos.y()
                 else:
@@ -464,6 +468,8 @@ class FloatingPillWidget(QWidget):
                         self.cancel_requested.emit()
                     else:
                         self.toggle_requested.emit()
+                elif self._mode == PillMode.DOWNLOADING:
+                    self.download_clicked.emit()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -585,6 +591,33 @@ class FloatingPillWidget(QWidget):
         self.show()
         if not self._anim_timer.isActive():
             self._anim_timer.start()
+        self.update()
+
+    def show_downloading(self, label: str, percent: int = -1) -> None:
+        """Show compact download progress inside the Flow Bar (clicking opens Settings)."""
+        self._hide_timer.stop()
+        self._leave_timer.stop()
+        self._mode = PillMode.DOWNLOADING
+        self._command_mode = False
+        self._preview_text = ""
+        self._cancel_hovered = False
+        self._download_label = (label or "Model").strip()
+        self._download_percent = -1 if percent < 0 else max(0, min(100, int(percent)))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        display = (
+            f"↓ {self._download_label} · {self._download_percent}%"
+            if self._download_percent >= 0
+            else f"↓ {self._download_label}..."
+        )
+        width = max(156, min(260, self._font_metrics.horizontalAdvance(display) + 30))
+        if self.width() != width or not self.isVisible():
+            self._apply_width_and_position(width)
+            self.show()
+        if self._download_percent < 0 and not self._anim_timer.isActive():
+            self._anim_timer.start()
+        elif self._download_percent >= 0 and self._anim_timer.isActive():
+            self._anim_timer.stop()
         self.update()
 
     def show_notice(self, text: str, *, is_error: bool = False, duration_ms: int = 2200) -> None:
@@ -737,6 +770,8 @@ class FloatingPillWidget(QWidget):
             self._paint_recording(painter)
         elif self._mode in (PillMode.TRANSCRIBING, PillMode.POLISHING):
             self._paint_processing(painter)
+        elif self._mode == PillMode.DOWNLOADING:
+            self._paint_downloading(painter)
         elif self._mode == PillMode.NOTICE:
             self._paint_notice(painter)
 
@@ -985,6 +1020,55 @@ class FloatingPillWidget(QWidget):
             QRectF(44, 0, COMPACT_WIDTH - 52, PILL_HEIGHT),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
             label,
+        )
+
+    def _paint_downloading(self, painter: QPainter) -> None:
+        is_light = self._resolved_theme == "light"
+        w = float(self.width())
+        h = float(PILL_HEIGHT)
+
+        # Clip progress bar inside the rounded pill body
+        clip_path = QPainterPath()
+        clip_path.addRoundedRect(QRectF(1.0, 1.0, w - 2.0, h - 2.0), (h - 2.0) / 2.0, (h - 2.0) / 2.0)
+        painter.save()
+        painter.setClipPath(clip_path)
+
+        # Track + fill bar along bottom edge
+        bar_h = 3.0
+        bar_y = h - bar_h - 1.0
+        track_color = QColor(24, 24, 27, 24) if is_light else QColor(255, 255, 255, 22)
+        painter.fillRect(QRectF(0.0, bar_y, w, bar_h), track_color)
+
+        fill_grad = QLinearGradient(0.0, 0.0, w, 0.0)
+        if is_light:
+            fill_grad.setColorAt(0.0, QColor(13, 148, 136))
+            fill_grad.setColorAt(1.0, QColor(124, 58, 237))
+        else:
+            fill_grad.setColorAt(0.0, QColor(45, 212, 191))
+            fill_grad.setColorAt(1.0, QColor(167, 139, 250))
+
+        if self._download_percent >= 0:
+            fill_w = w * (self._download_percent / 100.0)
+            painter.fillRect(QRectF(0.0, bar_y, fill_w, bar_h), fill_grad)
+        else:
+            # Smooth indeterminate sliding bar
+            seg_w = w * 0.34
+            pos = ((math.sin(self._phase * 0.7) + 1.0) / 2.0) * (w - seg_w)
+            painter.fillRect(QRectF(pos, bar_y, seg_w, bar_h), fill_grad)
+        painter.restore()
+
+        display = (
+            f"↓ {self._download_label} · {self._download_percent}%"
+            if self._download_percent >= 0
+            else f"↓ {self._download_label}..."
+        )
+        text_color = QColor(24, 24, 27) if is_light else QColor(243, 244, 246)
+        painter.setPen(text_color)
+        painter.setFont(self._font_label)
+        painter.drawText(
+            QRectF(12.0, 0.0, w - 24.0, h - 2.0),
+            Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextSingleLine,
+            display,
         )
 
     def _paint_notice(self, painter: QPainter) -> None:
