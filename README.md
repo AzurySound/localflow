@@ -2,198 +2,123 @@
 
 <p align="center">
   <strong>Local, privacy-first, open-source Wispr Flow alternative for Windows.</strong><br>
-  Offline voice dictation & smart LLM cleanup powered by <code>faster-whisper</code> and embedded <code>llama.cpp</code> (Vulkan/CPU) or Ollama.
+  Offline voice dictation & smart LLM text cleanup. 100% private, zero cloud dependencies.
+</p>
+
+<p align="center">
+  <a href="https://github.com/AzurySound/localflow/releases/latest">
+    <img src="https://img.shields.io/badge/Download-LocalFlow%20Setup%20(v0.2.0)-2563eb?style=for-the-badge&logo=windows&logoColor=white" alt="Download">
+  </a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/flow_bar_recording.gif" alt="LocalFlow Flow Bar" width="260" style="border-radius: 10px;">
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-blue?logo=windows" alt="Platform">
-  <img src="https://img.shields.io/badge/Python-3.12-blue?logo=python" alt="Python 3.12">
-  <img src="https://img.shields.io/badge/UI-PySide6-41CD52?logo=qt" alt="PySide6">
-  <img src="https://img.shields.io/badge/ASR-faster--whisper-orange" alt="faster-whisper">
-  <img src="https://img.shields.io/badge/LLM-llama.cpp%20%7C%20Ollama-violet" alt="llama.cpp / Ollama">
-  <img src="https://img.shields.io/badge/Tests-211%20passed-brightgreen" alt="Tests">
-  <img src="https://img.shields.io/badge/License-MIT-green" alt="License: MIT">
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/flow_bar_recording.gif" alt="LocalFlow Flow Bar" width="260" style="border-radius: 12px;">
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT License">
+  <img src="https://img.shields.io/badge/Engine-faster--whisper%20%2B%20llama.cpp-violet" alt="Engine">
+  <img src="https://img.shields.io/badge/Tests-211%20passing-brightgreen" alt="Tests">
 </p>
 
 ---
 
-## Highlights
-
-- **100% Offline & Private**: Audio and transcripts never leave your computer. No cloud accounts, API keys, or subscriptions required.
-- **Global Hotkey Activation**: Double-tap `CapsLock` to start dictating from anywhere in Windows. Tap `CapsLock` again to stop, polish, and paste directly into your active window.
-- **Selection Command Mode**: Highlight any text and press `Ctrl + 2× CapsLock` to transform it via voice command (*"translate to English"*, *"summarize"*, *"format as bullet list"*).
-- **Floating Flow Bar**: Ultra-thin desktop pill with live audio waveform, copy-to-clipboard button, and subtle audio cues.
-- **App-Aware Smart Styles**: Automatically adapts text style based on the active application (AI chats, IDEs, messengers, documents, or raw text).
-- **Embedded LLM Engine**: Ships with an embedded `llama-server` runtime supporting Vulkan GPU acceleration and CPU fallback. Automatically downloads compact models in 1 click. External **Ollama** is also supported.
-- **Bilingual Support**: Full interface and prompt support for **English** and **Russian**.
-- **Dark, Light & System Themes**: Clean modern aesthetic with automatic Windows accent and theme detection.
-- **Insights & Vocabulary**: Personal dictionary for technical terms/replacements, dictation history with search, and usage analytics.
-
-<p align="center">
-  <img src="docs/screenshots/flow_bar_showcase.png" alt="LocalFlow Flow Bar Modes" width="700">
-</p>
-
----
-
-## Global Hotkeys
+## How It Works
 
 | Hotkey | Action |
 |---|---|
-| `2× CapsLock` | **Start recording** (double-tap within 320 ms). |
-| `CapsLock` | **Finish & Paste**: transcribes audio, cleans with LLM, and pastes into the active input. |
-| `Ctrl + 2× CapsLock` | **Command on Selection**: executes a voice command over selected text. |
-| `Esc` | **Cancel recording** without pasting or modifying clipboard. |
-
----
-
-## Smart Cleanup V2 (LLM Polishing)
-
-Raw voice transcripts often contain stuttering, pause artifacts, and self-corrections. LocalFlow uses local LLMs (`gemma3-4b`, `gemma4:e4b`, `qwen2.5:1.5b`, etc.) to refine spoken audio into clean written text:
-
-- **Self-Correction & Pivot Resolution**: If you change your mind mid-sentence (*"let's add a button, actually let's finish for today"*), LocalFlow keeps only the final intent.
-- **Pause & Break Healing**: Glues thoughts split across speech pauses (`...` + Capital letter) into natural sentences.
-- **Filler Word & Stammer Removal**: Strips hesitations and repeated words (*"не проводит, не делает"* &rarr; *"не делает"*, *"um"*, *"you know"*, *"ну то есть"*).
-- **Technical Term Preservation**: Keeps English IT terms intact in Latin script (`fix`, `fallback`, `API`, `commit`, `Whisper`, `speech-to-text`) and heals phonetic mishearings.
-- **Automatic Numbered Lists**: Enumerates multi-item prompts (*"first ..., second ..., third ..."*) into formatted Markdown lists.
-
----
-
-## App-Aware Adaptive Styles
-
-LocalFlow detects your active foreground window and selects the ideal formatting profile:
-
-| Profile | Target Applications | Behavior |
-|---|---|---|
-| `ai_prompt` | Antigravity, Cursor, Windsurf, ChatGPT, Claude, Gemini | Crisp prompts, imperative voice, technical terms, auto-lists for 3+ items. |
-| `messenger_alive` | Telegram, Discord, Slack, WhatsApp | Lively, conversational tone; preserves slang and emotion; removes trailing period. |
-| `ide_technical` | VS Code, Visual Studio, Windows Terminal | Strict preservation of `camelCase`, `snake_case`, filenames, CLI flags, and code snippets. |
-| `mail_docs` | Outlook, Word, Notion, Obsidian | Structured paragraphs and bullet points. |
-| `browser_query` | Chrome, Edge, Firefox | Concise search queries without conversational fluff. |
-| `raw` | Any configured app | Direct Whisper transcript without LLM post-processing. |
-
----
-
-## Interface & Configuration
-
-### Settings & LLM Engine
-Configure your performance profile, choose between embedded `llama.cpp` (with Vulkan GPU / CPU) or Ollama, manage hotkeys, UI themes, and audio feedback:
+| `2× CapsLock` | **Start dictating** anywhere in Windows. |
+| `CapsLock` | **Finish & Paste**: transcribes, cleans up speech, and pastes into the active field. |
+| `Ctrl + 2× CapsLock` | **Command on Selection**: highlight text and tell LocalFlow what to do (*"summarize"*, *"translate"*, *"make a list"*). |
+| `Esc` | **Cancel** without pasting. |
 
 <p align="center">
-  <img src="docs/screenshots/settings_window.png" alt="LocalFlow Settings & Model Configuration" width="780">
-</p>
-
-### App-Aware Style & Prompt Editor
-Customize instructions per application and refine the base prompt:
-
-<p align="center">
-  <img src="docs/screenshots/style_and_prompt.png" alt="App-Aware Style & Prompt Configuration" width="780">
-</p>
-
-### History & Usage Analytics
-Review past transcripts, search dictation logs, and monitor productivity metrics:
-
-<p align="center">
-  <img src="docs/screenshots/insights_window.png" alt="LocalFlow History & Usage Analytics" width="780">
+  <img src="docs/screenshots/flow_bar_showcase.png" alt="LocalFlow Flow Bar States" width="680">
 </p>
 
 ---
 
-## Installation
+## Key Features
 
-### For End Users
-
-1. Download **`LocalFlow-Setup-0.2.0.exe`** from [Releases](https://github.com/AzurySound/localflow/releases).
-2. Run the installer (installs per-user to `%LOCALAPPDATA%\LocalFlow`, no administrator privileges required).
-   > *Note*: If Windows SmartScreen displays an alert for an unsigned executable, click **More info** &rarr; **Run anyway**.
-3. On first launch, LocalFlow will prompt you to download the default lightweight models:
-   - **Speech-to-Text**: Whisper `small` (~460 MB) or `large-v3-turbo` (~1.6 GB).
-   - **Smart Cleanup Engine**: Embedded `llama.cpp` runtime (~30 MB) + `Qwen 2.5 1.5B` (~1.0 GB) or `Gemma 3 4B` (~2.5 GB).
-4. Alternatively, switch the backend to **Ollama** in Settings to reuse your existing local models (`ollama run gemma4:e4b` or `qwen2.5:7b`).
-
-A standalone **`LocalFlow-0.2.0-portable.zip`** is also available for portable use without installation.
+- **100% Local & Private**: Audio and text never leave your computer. No accounts, API keys, or subscriptions.
+- **Smart Speech Cleanup**: Removes filler words (*"um"*, *"uh"*, *"you know"*, *"ну то есть"*), fixes stutters, glues awkward pause breaks, and resolves mid-sentence corrections (*"let's add a button, actually let's finish for today"* &rarr; keeps only the final thought).
+- **IT & Technical Terms**: Preserves English programming terms, CLI flags, camelCase, and snake_case in Latin script without weird transliteration.
+- **App-Aware Styles**: Automatically formats text to match what you are doing:
+  - 🤖 **AI Chats & IDEs** (Antigravity, Cursor, ChatGPT): crisp prompts with automatic numbered lists for 3+ items.
+  - 💬 **Messengers** (Telegram, Slack, Discord): natural conversational tone.
+  - 📄 **Docs & Email** (Word, Notion, Outlook): clean paragraphs and bullet points.
+  - ⌨ **Raw Mode**: direct transcript without LLM edits.
+- **Standalone Engine**: Includes an embedded `llama.cpp` runtime with Vulkan GPU acceleration & 1-click model downloads. External **Ollama** is also supported.
+- **Bilingual & Themed**: English and Russian UI with Dark, Light, and System themes.
 
 ---
 
-## Development
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/settings_window.png" alt="LocalFlow Settings" width="740">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/insights_window.png" alt="Usage Analytics" width="740">
+</p>
+
+---
+
+## Quick Install
+
+1. Download **[LocalFlow-Setup-0.2.0.exe](https://github.com/AzurySound/localflow/releases/latest)** *(or the portable ZIP)*.
+2. Run the installer (installs per-user, no admin rights required).
+3. On first launch, download the recommended lightweight models in 1 click:
+   - **Speech Recognition**: Whisper `small` (~460 MB) or `large-v3-turbo` (~1.6 GB).
+   - **Smart Cleanup**: Embedded `Qwen 2.5 1.5B` (~1.0 GB) or `Gemma 3 4B` (~2.5 GB).
+
+*(Optional: switch to Ollama in Settings if you already run models locally).*
+
+---
+
+## Architecture
+
+<p align="center">
+  <img src="docs/screenshots/architecture_diagram.png" alt="Architecture Diagram" width="800">
+</p>
+
+---
+
+<details>
+<summary><strong>For Developers: Building & Running from Source</strong></summary>
 
 ### Prerequisites
-
 - Windows 10 / 11 (x64)
 - Python 3.12
-- [uv](https://github.com/astral-sh/uv) (recommended) or pip
+- [uv](https://github.com/astral-sh/uv) (recommended)
 
-### Run from Source
-
+### Run Locally
 ```powershell
-# Clone repository
 git clone https://github.com/AzurySound/localflow.git
 cd localflow
-
-# Install dependencies and sync virtual environment
 uv sync --python 3.12
-
-# Run LocalFlow
 uv run localflow
 ```
 
-### Running Tests
-
-LocalFlow has comprehensive unit and integration test coverage:
-
+### Run Tests
 ```powershell
 uv run pytest -q
 # 211 passed, 41 subtests passed
 ```
 
-### Building the Release Package
+### Build Installer
+```powershell
+# Requires Inno Setup 6 (winget install JRSoftware.InnoSetup)
+.\packaging\build_release.ps1
+```
+Output binaries will be placed in `release\`.
 
-To build the thin standalone executable, portable ZIP, and Inno Setup installer:
-
-1. Install **Inno Setup 6** (one-time setup):
-   ```powershell
-   winget install JRSoftware.InnoSetup
-   ```
-2. Run the automated release build script:
-   ```powershell
-   .\packaging\build_release.ps1
-   ```
-The output artifacts will be created in `release\`:
-- `release\LocalFlow-Setup-0.2.0.exe` (~84 MB thin installer)
-- `release\LocalFlow-0.2.0-portable.zip` (~123 MB portable archive)
-
----
-
-## Architecture & Tech Stack
-
-<p align="center">
-  <img src="docs/screenshots/architecture_diagram.png" alt="LocalFlow Architecture & Data Flow Diagram" width="840">
-</p>
-
-### Core Technologies
-
-- **Desktop UI**: PySide6 (Qt for Python) — responsive dark/light theme, custom QPainter audio waveforms, non-stealing Win32 window flags (`WS_EX_NOACTIVATE`).
-- **Audio & VAD**: `sounddevice` + `numpy` (16 kHz mono PCM) with `Silero VAD` (ONNX) for real-time speech activity detection and silence auto-stop.
-- **Speech-to-Text (ASR)**: `faster-whisper` (CTranslate2) with GPU CUDA or CPU acceleration, technical prompt biasing, and streaming chunked sessions.
-- **Smart Cleanup Engine (V2)**:
-  - **Embedded Standalone**: Managed `llama.cpp` (`llama-server.exe`) with Vulkan GPU acceleration & CPU fallback (`Qwen 2.5 1.5B`, `Gemma 3 4B`).
-  - **External Ollama**: Direct HTTP keep-alive connection pool with automatic model warmup (`gemma4:e4b`, `qwen2.5:14b`).
-- **Windows Integration**: Win32 low-level keyboard hook (`SetWindowsHookExW`), foreground window classifier, clipboard history backup & restore, and synthesized `SendInput` auto-paste.
-- **Persistence**: SQLite with WAL journal mode (`%APPDATA%\LocalFlow\history.db`) for dictation logs and usage analytics.
-
----
-
-## Configuration & Storage
-
-User data and models are stored locally:
-- **Configuration & History**: `%APPDATA%\LocalFlow\` (`config.json`, `history.db`)
-- **Downloaded Models**: `%APPDATA%\LocalFlow\models\` (`whisper\`, `llm\`, `llama_runtime\`)
+</details>
 
 ---
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+MIT License — see [LICENSE](LICENSE) for details.
