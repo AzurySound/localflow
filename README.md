@@ -169,47 +169,20 @@ The output artifacts will be created in `release\`:
 
 ## Architecture & Tech Stack
 
-```text
-                  +---------------------------+
-                  |  Win32 Low-Level Hook     |  (2x CapsLock / Ctrl+2x CapsLock)
-                  +-------------+-------------+
-                                |
-                                v
-+-----------------------------------------------------------+
-|                        LocalFlow                          |
-|                                                           |
-|  +-------------------+              +------------------+  |
-|  |   PySide6 GUI     |              |  Audio Recorder  |  |
-|  | (Flow Bar, Tray,  |              |  (sounddevice,   |  |
-|  |  Settings, Hub)   |              |   Silero VAD)    |  |
-|  +-------------------+              +--------+---------+  |
-|                                              |            |
-|                                              v            |
-|                                     +------------------+  |
-|                                     |  faster-whisper  |  |
-|                                     |  (CTranslate2)   |  |
-|                                     +--------+---------+  |
-|                                              |            |
-|                                              v            |
-|  +-------------------------------------------+---------+  |
-|  |                 Smart Cleanup Engine                |  |
-|  |  Embedded llama-server (Vulkan/CPU)  OR  Ollama API |  |
-|  |  App-Aware Style Profiles + Custom Vocabulary       |  |
-|  +-------------------------------------------+---------+  |
-|                                              |            |
-+----------------------------------------------|------------+
-                                               v
-                                  +-------------------------+
-                                  | Win32 Input Injector    |  (SendInput + Auto-Paste)
-                                  +-------------------------+
-```
+<p align="center">
+  <img src="docs/screenshots/architecture_diagram.png" alt="LocalFlow Architecture & Data Flow Diagram" width="840">
+</p>
 
-- **GUI**: PySide6 (Qt for Python)
-- **Audio Capture**: `sounddevice` + `numpy` with Silero VAD
-- **Speech-to-Text**: `faster-whisper` (CTranslate2) with optional CUDA acceleration
-- **LLM Cleanup**: Embedded `llama.cpp` (`llama-server.exe`) or external `Ollama` HTTP API
-- **Windows Integration**: Win32 low-level keyboard hooks (`SetWindowsHookExW`), clipboard preservation & keyboard emulation (`SendInput`)
-- **Storage**: SQLite (`%APPDATA%\LocalFlow\history.db`) + atomic JSON configuration
+### Core Technologies
+
+- **Desktop UI**: PySide6 (Qt for Python) — responsive dark/light theme, custom QPainter audio waveforms, non-stealing Win32 window flags (`WS_EX_NOACTIVATE`).
+- **Audio & VAD**: `sounddevice` + `numpy` (16 kHz mono PCM) with `Silero VAD` (ONNX) for real-time speech activity detection and silence auto-stop.
+- **Speech-to-Text (ASR)**: `faster-whisper` (CTranslate2) with GPU CUDA or CPU acceleration, technical prompt biasing, and streaming chunked sessions.
+- **Smart Cleanup Engine (V2)**:
+  - **Embedded Standalone**: Managed `llama.cpp` (`llama-server.exe`) with Vulkan GPU acceleration & CPU fallback (`Qwen 2.5 1.5B`, `Gemma 3 4B`).
+  - **External Ollama**: Direct HTTP keep-alive connection pool with automatic model warmup (`gemma4:e4b`, `qwen2.5:14b`).
+- **Windows Integration**: Win32 low-level keyboard hook (`SetWindowsHookExW`), foreground window classifier, clipboard history backup & restore, and synthesized `SendInput` auto-paste.
+- **Persistence**: SQLite with WAL journal mode (`%APPDATA%\LocalFlow\history.db`) for dictation logs and usage analytics.
 
 ---
 
