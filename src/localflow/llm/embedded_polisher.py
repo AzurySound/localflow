@@ -37,10 +37,11 @@ class EmbeddedLlamaPolisher:
         custom_model_path: str = "",
         system_prompt: str = "",
         timeout_sec: float = 45.0,
-        keep_alive: str = "5m",
-        num_ctx: int = 2048,
+        keep_alive: str = "10m",
+        num_ctx: int = 4096,
         num_gpu: int | None = None,
         vocabulary: ParsedVocabulary | str | None = None,
+        lang: str | None = None,
         base_dir: Path | None = None,
         server_manager: LlamaServerManager | None = None,
         client: httpx.Client | None = None,
@@ -50,11 +51,14 @@ class EmbeddedLlamaPolisher:
         self.system_prompt = system_prompt
         self.timeout_sec = timeout_sec
         self.keep_alive = keep_alive
-        self.num_ctx = num_ctx
+        self.num_ctx = max(2048, int(num_ctx))
         self.num_gpu = num_gpu
         self.vocabulary = _normalize_vocabulary(vocabulary)
+        self.lang = lang
         self._base_dir = base_dir
         self._lock = threading.Lock()
+        self._warmup_lock = threading.Lock()
+        self._warming = False
         self._manager = server_manager
         self._owns_manager = server_manager is None
         self._owns_client = client is None
@@ -95,12 +99,19 @@ class EmbeddedLlamaPolisher:
         return [m.id for m in EMBEDDED_LLM_MODELS]
 
     def warmup(self) -> None:
+        with self._warmup_lock:
+            if self._warming:
+                return
+            self._warming = True
         try:
             mgr = self._get_or_create_manager()
             mgr.ensure_started()
             mgr.touch_activity()
         except Exception:
             pass
+        finally:
+            with self._warmup_lock:
+                self._warming = False
 
     def unload(self) -> None:
         with self._lock:
@@ -120,14 +131,14 @@ class EmbeddedLlamaPolisher:
             except Exception:
                 pass
 
-    def _chat_completion(
+    def _chat_completion_with_meta(
         self,
         *,
         system_content: str,
         user_content: str,
         temperature: float,
         max_tokens: int,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         mgr = self._get_or_create_manager()
         base_url = mgr.ensure_started()
         try:
@@ -147,12 +158,33 @@ class EmbeddedLlamaPolisher:
             data = resp.json()
             choices = data.get("choices") if isinstance(data, dict) else None
             if not isinstance(choices, list) or not choices:
-                return ""
-            msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+                return ("", None)
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            msg = first.get("message")
             content = msg.get("content") if isinstance(msg, dict) else None
-            return content if isinstance(content, str) else ""
+            finish_reason = first.get("finish_reason")
+            return (
+                content if isinstance(content, str) else "",
+                finish_reason if isinstance(finish_reason, str) else None,
+            )
         finally:
             mgr.touch_activity()
+
+    def _chat_completion(
+        self,
+        *,
+        system_content: str,
+        user_content: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        content, _finish_reason = self._chat_completion_with_meta(
+            system_content=system_content,
+            user_content=user_content,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return content
 
     def polish(
         self,
@@ -198,15 +230,16 @@ class EmbeddedLlamaPolisher:
             window_context=window_context,
             vocabulary=self.vocabulary,
             style_profile=effective_style,
+            lang=self.lang,
         )
         temperature = effective_style.temperature if effective_style is not None else 0.05
         if effective_style is not None and effective_style.key == "ai_prompt" and not is_short_prompt_guard:
-            max_tokens = max(256, min(1024, len(prepared_text) * 3))
+            max_tokens = max(256, min(2048, len(prepared_text) * 3))
         else:
-            max_tokens = max(128, min(1024, len(prepared_text) * 2))
+            max_tokens = max(256, min(2048, len(prepared_text) * 2))
 
         try:
-            raw_content = self._chat_completion(
+            raw_content, finish_reason = self._chat_completion_with_meta(
                 system_content=system_content,
                 user_content=format_polish_user_message(prepared_text),
                 temperature=temperature,
@@ -215,7 +248,7 @@ class EmbeddedLlamaPolisher:
             content = strip_transcript_wrapper(raw_content)
             if not content:
                 return PolishResult(text=prepared_text, used_llm=False, error="Empty LLM response")
-            leak_err = validate_polish_output(content, prepared_text)
+            leak_err = validate_polish_output(content, prepared_text, finish_reason=finish_reason)
             if leak_err is not None:
                 return PolishResult(text=prepared_text, used_llm=False, error=leak_err)
             if self.vocabulary.replacements:
@@ -248,6 +281,7 @@ class EmbeddedLlamaPolisher:
         system_content = _build_transform_system_prompt(
             window_context=window_context,
             vocabulary=self.vocabulary,
+            lang=self.lang,
         )
         user_content = (
             f"<selected_text>\n{selected_text}\n</selected_text>\n\n"

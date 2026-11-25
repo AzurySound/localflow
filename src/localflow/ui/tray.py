@@ -57,6 +57,7 @@ class LocalFlowTray(QSystemTrayIcon):
     unsnooze_requested = Signal()
     reset_position_requested = Signal()
     copy_last_dictation_requested = Signal()
+    copy_last_raw_requested = Signal()
     quit_requested = Signal()
 
     def __init__(
@@ -79,6 +80,7 @@ class LocalFlowTray(QSystemTrayIcon):
         self._resolved_theme: ResolvedTheme = theme
         self._lang: LanguageCode = normalize_language(lang)
         self._last_preview_raw: str = ""
+        self._last_raw_asr: str = ""
 
         self.setIcon(self._icon_idle)
         self.setToolTip(tr("tray.tooltip", self._lang))
@@ -144,6 +146,11 @@ class LocalFlowTray(QSystemTrayIcon):
         self._copy_last_action.triggered.connect(self.copy_last_dictation_requested.emit)
         menu.addAction(self._copy_last_action)
 
+        self._copy_raw_action = QAction(tr("menu.copy_raw_asr", self._lang), menu)
+        self._copy_raw_action.triggered.connect(self.copy_last_raw_requested.emit)
+        self._copy_raw_action.setVisible(False)
+        menu.addAction(self._copy_raw_action)
+
         self._open_action = QAction(tr("menu.settings", self._lang), menu)
         self._open_action.triggered.connect(self.open_settings_requested.emit)
         menu.addAction(self._open_action)
@@ -173,9 +180,11 @@ class LocalFlowTray(QSystemTrayIcon):
         self._reset_pos_action.setText(tr("menu.reset_pos", self._lang))
         self._llm_action.setText(tr("menu.smart_cleanup", self._lang))
         self._copy_last_action.setText(tr("menu.copy_to_clipboard", self._lang))
+        self._copy_raw_action.setText(tr("menu.copy_raw_asr", self._lang))
         self._open_action.setText(tr("menu.settings", self._lang))
         self._quit_action.setText(tr("menu.quit", self._lang))
         self.set_last_dictation_preview(self._last_preview_raw)
+        self.set_last_raw_preview(self._last_raw_asr)
 
     def set_theme(self, theme: ResolvedTheme) -> None:
         self._resolved_theme = theme
@@ -238,6 +247,25 @@ class LocalFlowTray(QSystemTrayIcon):
             self._copy_last_action.setToolTip(tr("menu.copy_tooltip", self._lang, snippet=snippet))
         else:
             self._copy_last_action.setToolTip("")
+        self._sync_copy_raw_visibility()
+
+    def set_last_raw_preview(self, text: str | None) -> None:
+        self._last_raw_asr = text or ""
+        snippet = " ".join(self._last_raw_asr.split())
+        if snippet:
+            if len(snippet) > 48:
+                snippet = snippet[:47] + "…"
+            self._copy_raw_action.setToolTip(tr("menu.copy_tooltip", self._lang, snippet=snippet))
+        else:
+            self._copy_raw_action.setToolTip("")
+        self._sync_copy_raw_visibility()
+
+    def _sync_copy_raw_visibility(self) -> None:
+        distinct = bool(
+            self._last_raw_asr.strip()
+            and self._last_raw_asr.strip() != self._last_preview_raw.strip()
+        )
+        self._copy_raw_action.setVisible(distinct)
 
     def set_state_icon(self, state: str) -> None:
         if state == "recording":

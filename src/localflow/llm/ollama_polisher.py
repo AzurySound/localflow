@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass
 from typing import cast
 
@@ -41,10 +42,11 @@ _CATEGORY_INSTRUCTIONS: dict[WindowCategory, str] = {
 }
 
 _TRANSFORM_SYSTEM_PROMPT = (
-    "You are a text editor. Transform the text inside <selected_text> strictly following the instruction in <command>.\n"
+    "You are a precise text editor. Transform <selected_text> strictly following the spoken instruction in <command>.\n"
     "Rules:\n"
-    "1. Execute only the requested command, preserving original facts and language unless translation is requested.\n"
-    "2. Return ONLY the final result — no tags, quotes, explanations, or commentary."
+    "1. Interpret minor voice-recognition typos in <command> by intent (e.g. 'на форме как промпт' = 'оформи как промпт').\n"
+    "2. If asked to condense/tighten ('ужми', 'сократи', 'condense', 'for prompt'), actively remove fluff and filler while keeping all key facts.\n"
+    "3. Keep original language unless translation is requested. Return ONLY the transformed text — no tags, quotes, or commentary."
 )
 
 _KNOWN_CATEGORIES: frozenset[str] = frozenset(
@@ -93,15 +95,53 @@ def strip_transcript_wrapper(content: str) -> str:
     return content.strip()
 
 
-def validate_polish_output(content: str, prepared_text: str) -> str | None:
-    """Return an error reason if LLM polish output leaked system prompt or hallucinated."""
+_BYPASS_CUE_RE = re.compile(
+    r"(?:^|\b)(?:"
+    r"ну|типа|короче|в\s+общем|как\s+его|как\s+бы|то\s+есть|ой\s+нет|вернее|"
+    r"ээ+|мм+|um+|uh+|erm+|like|you\s+know|i\s+mean|actually"
+    r")(?:\b|$)",
+    re.IGNORECASE,
+)
+
+
+def should_bypass_llm(text: str, style_profile: StyleProfile | None = None) -> bool:
+    """Return True when a short, clean transcript needs zero LLM cleanup."""
+    if style_profile is not None and not style_profile.use_llm:
+        return True
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    words = stripped.split()
+    if len(words) > 5:
+        return False
+    if "..." in stripped or "…" in stripped:
+        return False
+    if _BYPASS_CUE_RE.search(stripped):
+        return False
+    return True
+
+
+def validate_polish_output(
+    content: str,
+    prepared_text: str,
+    *,
+    finish_reason: str | None = None,
+) -> str | None:
+    """Return an error reason if LLM polish output leaked system prompt, truncated, or hallucinated."""
+    if finish_reason == "length":
+        return "LLM output truncated (finish_reason=length)"
+
     low = content.lower()
     for marker in _SYSTEM_LEAK_MARKERS:
         if marker in low:
             return f"LLM output leaked system prompt ({marker})"
 
+    # Guard against severe mid-sentence truncation on multi-clause / long inputs
+    src_len = len(prepared_text.strip())
+    if src_len >= 80 and len(content.strip()) < src_len * 0.45:
+        return "LLM output unexpectedly truncated input text"
+
     # Guard against small-model continuation hallucinations (e.g. 4-word input -> 400-char essay)
-    src_len = len(prepared_text)
     if src_len > 0 and len(content) > max(src_len * 2.5 + 48, 120):
         return "LLM output unexpectedly expanded input text"
     return None
@@ -146,6 +186,7 @@ def build_polish_system_prompt(
     window_context: ActiveWindowContext | str | None = None,
     vocabulary: ParsedVocabulary | str | None = None,
     style_profile: StyleProfile | None = None,
+    lang: str | None = None,
 ) -> str:
     """Build system prompt enriched with active window context, style profile, and personal vocabulary."""
     style_instruction = style_profile.instruction.strip() if style_profile is not None else ""
@@ -158,7 +199,7 @@ def build_polish_system_prompt(
     else:
         ctx_line, category = _resolve_window_context(window_context)
     vocab = _normalize_vocabulary(vocabulary)
-    vocab_block = format_vocabulary_for_llm(vocab).strip()
+    vocab_block = format_vocabulary_for_llm(vocab, lang=lang).strip()
 
     if not ctx_line and category is None and not vocab_block and not style_instruction:
         return base_prompt
@@ -181,11 +222,13 @@ def _build_transform_system_prompt(
     *,
     window_context: ActiveWindowContext | str | None = None,
     vocabulary: ParsedVocabulary | str | None = None,
+    lang: str | None = None,
 ) -> str:
     return build_polish_system_prompt(
         _TRANSFORM_SYSTEM_PROMPT,
         window_context=window_context,
         vocabulary=vocabulary,
+        lang=lang,
     )
 
 
@@ -205,20 +248,24 @@ class OllamaPolisher:
         model: str = "qwen2.5:14b",
         system_prompt: str = "",
         timeout_sec: float = 35.0,
-        keep_alive: str = "2m",
-        num_ctx: int = 1024,
+        keep_alive: str = "10m",
+        num_ctx: int = 4096,
         num_gpu: int | None = None,
         client: httpx.Client | None = None,
         vocabulary: ParsedVocabulary | str | None = None,
+        lang: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.system_prompt = system_prompt
         self.timeout_sec = timeout_sec
         self.keep_alive = keep_alive
-        self.num_ctx = num_ctx
+        self.num_ctx = max(2048, int(num_ctx))
         self.num_gpu = num_gpu
         self.vocabulary = _normalize_vocabulary(vocabulary)
+        self.lang = lang
+        self._warmup_lock = threading.Lock()
+        self._warming = False
         self._owns_client = client is None
         self._client = (
             client
@@ -256,13 +303,17 @@ class OllamaPolisher:
         if num_predict is not None:
             opts["num_predict"] = num_predict
         elif raw_text is not None:
-            opts["num_predict"] = max(128, min(1024, len(raw_text) * 2))
+            opts["num_predict"] = max(256, min(2048, len(raw_text) * 2))
         if self.num_gpu is not None:
             opts["num_gpu"] = self.num_gpu
         return opts
 
     def warmup(self) -> None:
         """Pre-load the model into memory so the first dictation is instant."""
+        with self._warmup_lock:
+            if self._warming:
+                return
+            self._warming = True
         try:
             self._client.post(
                 f"{self.base_url}/api/generate",
@@ -276,6 +327,9 @@ class OllamaPolisher:
             )
         except Exception:
             pass
+        finally:
+            with self._warmup_lock:
+                self._warming = False
 
     def unload(self) -> None:
         """Ask Ollama to immediately evict the current model from VRAM."""
@@ -334,11 +388,12 @@ class OllamaPolisher:
             window_context=window_context,
             vocabulary=self.vocabulary,
             style_profile=effective_style,
+            lang=self.lang,
         )
         temperature = effective_style.temperature if effective_style is not None else 0.05
         num_predict = None
         if effective_style is not None and effective_style.key == "ai_prompt" and not is_short_prompt_guard:
-            num_predict = max(256, min(1024, len(prepared_text) * 3))
+            num_predict = max(256, min(2048, len(prepared_text) * 3))
 
         payload = {
             "model": self.model,
@@ -360,10 +415,12 @@ class OllamaPolisher:
             data = resp.json()
             msg = data.get("message") if isinstance(data, dict) else None
             raw_content = msg.get("content") if isinstance(msg, dict) else None
+            done_reason = data.get("done_reason") if isinstance(data, dict) else None
+            finish_reason = done_reason if isinstance(done_reason, str) else None
             content = strip_transcript_wrapper(raw_content) if isinstance(raw_content, str) else ""
             if not content:
                 return PolishResult(text=prepared_text, used_llm=False, error="Empty LLM response")
-            leak_err = validate_polish_output(content, prepared_text)
+            leak_err = validate_polish_output(content, prepared_text, finish_reason=finish_reason)
             if leak_err is not None:
                 return PolishResult(text=prepared_text, used_llm=False, error=leak_err)
             if self.vocabulary.replacements:
@@ -397,6 +454,7 @@ class OllamaPolisher:
         system_content = _build_transform_system_prompt(
             window_context=window_context,
             vocabulary=self.vocabulary,
+            lang=self.lang,
         )
         user_content = (
             f"<selected_text>\n{selected_text}\n</selected_text>\n\n"

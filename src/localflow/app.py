@@ -15,6 +15,7 @@ from localflow.audio.recorder import AudioRecorder, list_input_devices
 from localflow.audio.sound_fx import play_cue
 from localflow.autostart import set_autostart_enabled
 from localflow.config import (
+    COMMAND_WHISPER_PROMPT,
     AppConfig,
     apply_performance_profile,
     get_app_data_dir,
@@ -32,16 +33,16 @@ from localflow.llm.downloader import (
     get_whisper_model_dir,
 )
 from localflow.llm.embedded_polisher import EmbeddedLlamaPolisher
-from localflow.llm.ollama_polisher import OllamaPolisher
+from localflow.llm.ollama_polisher import OllamaPolisher, should_bypass_llm
 from localflow.storage import HistoryStorage
-from localflow.styles import resolve_style_profile
+from localflow.styles import apply_style_postprocessing, resolve_style_profile
 from localflow.ui.context_menu import QuickMenuCallbacks, QuickMenuState, build_quick_menu
 from localflow.ui.overlay_pill import FloatingPillWidget
 from localflow.ui.settings_window import SettingsWindow
 from localflow.ui.theme import resolve_theme
 from localflow.ui.tray import LocalFlowTray
 from localflow.vocabulary import (
-    apply_vocabulary_replacements,
+    apply_vocabulary_replacements_with_count,
     build_whisper_initial_prompt,
     parse_vocabulary,
 )
@@ -83,7 +84,7 @@ class LocalFlowController(QObject):
     _asr_download_progress = Signal(int, object)  # gen, DownloadProgress
     _stage_polishing = Signal(str)
     _stage_injecting = Signal()
-    _pipeline_done = Signal(bool, str, str)  # llm_fallback_needed, llm_err, final_text
+    _pipeline_done = Signal(bool, str, str, str)  # llm_fallback_needed, llm_err, final_text, raw_text
     _pipeline_empty = Signal(str)
     _pipeline_error = Signal(str)
     _profile_ready = Signal(str, object)  # profile, available_models (or None)
@@ -112,6 +113,7 @@ class LocalFlowController(QObject):
         self._asr_status_text = tr("menu.asr_loading_model", self._lang, model=self._config.whisper_model)
         recent = self._storage.list_recent(limit=1)
         self._last_dictation_text: str = recent[0].final_text if recent else ""
+        self._last_raw_text: str = recent[0].raw_text if recent else ""
         self._pool = QThreadPool.globalInstance()
 
         self._snooze_timer = QTimer(self)
@@ -151,6 +153,8 @@ class LocalFlowController(QObject):
         )
         if self._last_dictation_text:
             self._tray.set_last_dictation_preview(self._last_dictation_text)
+        if self._last_raw_text:
+            self._tray.set_last_raw_preview(self._last_raw_text)
         self._settings = SettingsWindow(self._config, self._storage)
         self._hotkey = GlobalHotkeyListener(threshold_ms=self._config.double_tap_ms)
 
@@ -243,6 +247,7 @@ class LocalFlowController(QObject):
                 num_ctx=cfg.ollama_num_ctx,
                 num_gpu=cfg.ollama_num_gpu,
                 vocabulary=vocab,
+                lang=cfg.language,
             )
         return OllamaPolisher(
             base_url=cfg.ollama_url,
@@ -253,6 +258,7 @@ class LocalFlowController(QObject):
             num_ctx=cfg.ollama_num_ctx,
             num_gpu=cfg.ollama_num_gpu,
             vocabulary=vocab,
+            lang=cfg.language,
         )
 
     def _connect_signals(self) -> None:
@@ -287,6 +293,7 @@ class LocalFlowController(QObject):
         self._tray.unsnooze_requested.connect(self._on_unsnooze)
         self._tray.reset_position_requested.connect(self._on_reset_pill_position)
         self._tray.copy_last_dictation_requested.connect(self._on_copy_last_dictation)
+        self._tray.copy_last_raw_requested.connect(self._on_copy_last_raw)
         self._tray.quit_requested.connect(self.shutdown)
 
         self._pill.position_changed.connect(self._on_pill_moved)
@@ -496,6 +503,21 @@ class LocalFlowController(QObject):
             clipboard.setText(text)
         self._pill.show_notice(tr("notice.last_copied", self._lang), duration_ms=1600)
 
+    def _on_copy_last_raw(self) -> None:
+        text = self._last_raw_text
+        if not text:
+            recent = self._storage.list_recent(limit=1)
+            if recent:
+                text = recent[0].raw_text
+                self._last_raw_text = text
+        if not text:
+            self._pill.show_notice(tr("notice.no_last_dictation", self._lang), duration_ms=1600)
+            return
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
+        self._pill.show_notice(tr("notice.raw_copied", self._lang), duration_ms=1600)
+
     def _on_toggle(self) -> None:
         if self._state == AppState.IDLE:
             self._start_recording()
@@ -561,6 +583,7 @@ class LocalFlowController(QObject):
         self._pill.show_recording(command_mode=True)
         if self._config.play_sounds:
             play_cue("start")
+        self._pool.start(_FnWorker(self._polisher.warmup))
 
     def _on_cancel(self) -> None:
         if self._state != AppState.RECORDING:
@@ -634,6 +657,8 @@ class LocalFlowController(QObject):
         self._pill.show_recording()
         if self._config.play_sounds:
             play_cue("start")
+        if self._config.llm_enabled:
+            self._pool.start(_FnWorker(self._polisher.warmup))
 
     def _stop_and_process(self) -> None:
         if self._state != AppState.RECORDING:
@@ -695,6 +720,8 @@ class LocalFlowController(QObject):
                         if (not raw_text or not raw_text.strip()) and session.errors:
                             self._pipeline_error.emit(str(session.errors[0]))
                             return
+                elif is_command:
+                    raw_text = asr.transcribe(audio, initial_prompt=COMMAND_WHISPER_PROMPT)
                 else:
                     raw_text = asr.transcribe(audio)
 
@@ -739,7 +766,7 @@ class LocalFlowController(QObject):
                         dict_fixes=0,
                         style_profile="command",
                     )
-                    self._pipeline_done.emit(False, "", final_text)
+                    self._pipeline_done.emit(False, "", final_text, raw_text)
                     return
 
                 final_text = raw_text
@@ -758,7 +785,7 @@ class LocalFlowController(QObject):
                 )
                 effective_style_key = active_style.key if cfg.llm_enabled else "raw"
 
-                if cfg.llm_enabled and active_style.use_llm:
+                if cfg.llm_enabled and active_style.use_llm and not should_bypass_llm(raw_text, active_style):
                     self._stage_polishing.emit(active_style.pill_label)
                     res = polisher.polish(
                         raw_text,
@@ -768,20 +795,26 @@ class LocalFlowController(QObject):
                     final_text = res.text
                     used_llm = res.used_llm
                     llm_err = res.error or ""
-                    if vocab.replacements or vocab.terms:
-                        low_raw = raw_text.lower()
-                        low_final = final_text.lower()
-                        for src, dst in vocab.replacements:
-                            if src.lower() in low_raw and dst.lower() in low_final:
+                    if vocab.replacements:
+                        _post, dict_fixes = apply_vocabulary_replacements_with_count(
+                            raw_text, vocab.replacements
+                        )
+                    if vocab.terms and final_text:
+                        low_raw = raw_text.casefold()
+                        low_final = final_text.casefold()
+                        for term in vocab.terms:
+                            t_low = term.casefold()
+                            if t_low in low_final and term not in raw_text and t_low in low_raw:
                                 dict_fixes += 1
                 else:
                     if vocab.replacements:
-                        replaced = apply_vocabulary_replacements(raw_text, vocab.replacements)
+                        replaced, dict_fixes = apply_vocabulary_replacements_with_count(
+                            raw_text, vocab.replacements
+                        )
                         if replaced.strip() and replaced != raw_text:
                             final_text = replaced
-                            for src, _dst in vocab.replacements:
-                                if src.lower() in raw_text.lower():
-                                    dict_fixes += 1
+                    if cfg.llm_enabled and active_style.use_llm:
+                        final_text = apply_style_postprocessing(final_text, active_style)
 
                 self._stage_injecting.emit()
                 injector.inject(
@@ -806,6 +839,7 @@ class LocalFlowController(QObject):
                     bool(llm_err and cfg.llm_enabled and active_style.use_llm),
                     llm_err,
                     final_text,
+                    raw_text,
                 )
             except Exception as exc:
                 if session is not None:
@@ -833,13 +867,18 @@ class LocalFlowController(QObject):
             tr("notice.error", self._lang, err=err[:36]), is_error=True, duration_ms=2600
         )
 
-    def _on_pipeline_done(self, llm_fallback: bool, llm_err: str, final_text: str) -> None:
+    def _on_pipeline_done(
+        self, llm_fallback: bool, llm_err: str, final_text: str, raw_text: str = ""
+    ) -> None:
         self._set_state(AppState.IDLE)
         self._run_history_auto_cleanup()
         if final_text:
             self._last_dictation_text = final_text
             self._tray.set_last_dictation_preview(final_text)
             self._pill.set_has_last_dictation(True)
+        if raw_text:
+            self._last_raw_text = raw_text
+            self._tray.set_last_raw_preview(raw_text)
         if llm_fallback:
             logger.warning("LLM polish fallback: %s", llm_err)
             if self._config.llm_backend == "embedded":
@@ -869,6 +908,7 @@ class LocalFlowController(QObject):
             show_idle_bar=self._config.show_idle_bar,
             is_snoozed=self._snooze_timer.isActive(),
             last_dictation_preview=self._last_dictation_text,
+            last_raw_preview=self._last_raw_text,
         )
         callbacks = QuickMenuCallbacks(
             on_select_mic=self._on_mic_selected,
@@ -880,6 +920,7 @@ class LocalFlowController(QObject):
             on_unsnooze=self._on_unsnooze,
             on_reset_position=self._on_reset_pill_position,
             on_copy_last_dictation=self._on_copy_last_dictation,
+            on_copy_last_raw=self._on_copy_last_raw,
             on_open_settings=self._settings.show_and_focus,
             on_quit=self.shutdown,
         )

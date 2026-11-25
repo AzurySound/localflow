@@ -72,7 +72,9 @@ def test_resolve_style_profile_app_routing_and_overrides() -> None:
     assert resolve_style_profile(chatgpt).key == "ai_prompt"
 
     chrome_generic = classify_window("chrome.exe", "Python docs - Google Chrome")
-    assert resolve_style_profile(chrome_generic).key == "ai_prompt"
+    assert resolve_style_profile(chrome_generic).key == "default"
+    sheets = classify_window("chrome.exe", "Done List - Google Sheets - Google Chrome")
+    assert resolve_style_profile(sheets).key == "mail_docs"
     assert (
         resolve_style_profile(
             chrome_generic,

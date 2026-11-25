@@ -11,8 +11,8 @@ class TestPerformanceProfiles(unittest.TestCase):
         self.assertEqual(updated.whisper_compute_type, "int8_float16")
         self.assertEqual(updated.whisper_beam_size, 2)
         self.assertEqual(updated.ollama_model, "qwen3.5:2b")
-        self.assertEqual(updated.ollama_keep_alive, "2m")
-        self.assertEqual(updated.ollama_num_ctx, 1024)
+        self.assertEqual(updated.ollama_keep_alive, "10m")
+        self.assertEqual(updated.ollama_num_ctx, 4096)
         self.assertIsNone(updated.ollama_num_gpu)
 
     def test_light_gpu_prefers_gemma4_e4b_over_legacy(self) -> None:

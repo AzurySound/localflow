@@ -180,6 +180,25 @@ class HistoryStorage:
     def list_all(self, *, include_deleted: bool = False) -> list[TranscriptionEntry]:
         return self.list_recent(limit=self.max_entries, include_deleted=include_deleted)
 
+    def update_entry_cleanup(
+        self,
+        entry_id: int,
+        *,
+        final_text: str,
+        llm_model: str | None,
+        used_llm: bool,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE transcriptions
+                SET final_text = ?, llm_model = ?, used_llm = ?
+                WHERE id = ?
+                """,
+                (final_text, llm_model, int(used_llm), int(entry_id)),
+            )
+            conn.commit()
+
     def delete_entry(self, entry_id: int, *, hard: bool = False) -> None:
         with self._connect() as conn:
             if hard:

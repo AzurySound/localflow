@@ -320,7 +320,7 @@ def test_r1_captures_active_window_context_on_main_thread_and_passes_to_polisher
 ) -> None:
     ctrl, h = make_harness(AppConfig(ollama_warmup_on_start=False))
     h.active_window_ctx = classify_window("Antigravity.exe", "main.py — Antigravity")
-    ctrl._asr.transcribe_fn = lambda audio, prompt: "проверь camelCase и snake_case"
+    ctrl._asr.transcribe_fn = lambda audio, prompt: "проверь camelCase и snake_case в новом модуле сейчас"
 
     ctrl._hotkey.toggle_requested.emit()
     assert ctrl._state == AppState.RECORDING
@@ -364,7 +364,7 @@ def test_r2_vocabulary_prompt_sync_on_init_and_apply_config_without_whisper_relo
     assert "FastAPI" in initial_asr.initial_prompt
     assert "Docker" in initial_asr.initial_prompt
 
-    ctrl._asr.transcribe_fn = lambda audio, prompt: "тест FastAPI"
+    ctrl._asr.transcribe_fn = lambda audio, prompt: "проверь пожалуйста наш новый FastAPI сервис"
     ctrl._hotkey.toggle_requested.emit()
     ctrl._recorder.next_chunked_duration = 1.0
     ctrl._recorder.next_tail_audio = np.ones(8000, dtype=np.float32) * 0.05
@@ -510,7 +510,7 @@ def test_r3_command_ignored_while_busy_and_esc_clears_pending_command_state(
     assert ctrl._pending_window_context is None
 
     # Subsequent normal dictation calls polish, NOT transform_selection
-    ctrl._asr.transcribe_fn = lambda audio, prompt: "обычная диктовка"
+    ctrl._asr.transcribe_fn = lambda audio, prompt: "ну давай проверим обычную диктовку"
     h.ollama_handler = lambda payload: httpx.Response(
         200, json={"message": {"content": "Обычная диктовка."}}
     )

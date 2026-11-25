@@ -36,6 +36,7 @@ class QuickMenuState:
     show_idle_bar: bool
     is_snoozed: bool
     last_dictation_preview: str = ""
+    last_raw_preview: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +52,7 @@ class QuickMenuCallbacks:
     on_copy_last_dictation: Callable[[], None]
     on_open_settings: Callable[[], None]
     on_quit: Callable[[], None]
+    on_copy_last_raw: Callable[[], None] | None = None
 
 
 def populate_microphone_menu(
@@ -189,6 +191,19 @@ def build_quick_menu(
         copy_last_act.setToolTip(tr("menu.copy_tooltip", lang, snippet=snippet))
     copy_last_act.triggered.connect(callbacks.on_copy_last_dictation)
     menu.addAction(copy_last_act)
+
+    has_distinct_raw = bool(
+        state.last_raw_preview.strip()
+        and state.last_raw_preview.strip() != state.last_dictation_preview.strip()
+    )
+    if callbacks.on_copy_last_raw is not None and has_distinct_raw:
+        copy_raw_act = QAction(tr("menu.copy_raw_asr", lang), menu)
+        raw_snippet = " ".join(state.last_raw_preview.split())
+        if len(raw_snippet) > 48:
+            raw_snippet = raw_snippet[:47] + "…"
+        copy_raw_act.setToolTip(tr("menu.copy_tooltip", lang, snippet=raw_snippet))
+        copy_raw_act.triggered.connect(callbacks.on_copy_last_raw)
+        menu.addAction(copy_raw_act)
 
     open_settings_act = QAction(tr("menu.settings", lang), menu)
     open_settings_act.triggered.connect(callbacks.on_open_settings)

@@ -49,16 +49,16 @@ class LlamaServerManager:
         binary_path: Path,
         model_path: Path,
         *,
-        num_ctx: int = 2048,
+        num_ctx: int = 4096,
         num_gpu: int | None = None,
-        keep_alive: str = "5m",
+        keep_alive: str = "10m",
         startup_timeout_sec: float = 90.0,
         popen_fn: Any = None,
         health_client: httpx.Client | None = None,
     ) -> None:
         self.binary_path = Path(binary_path)
         self.model_path = Path(model_path)
-        self.num_ctx = max(512, int(num_ctx))
+        self.num_ctx = max(2048, int(num_ctx))
         self.num_gpu = num_gpu
         self.idle_timeout_sec = parse_keep_alive_seconds(keep_alive)
         self.startup_timeout_sec = startup_timeout_sec

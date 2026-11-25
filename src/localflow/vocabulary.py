@@ -72,7 +72,7 @@ def build_whisper_initial_prompt(base_prompt: str, vocab: ParsedVocabulary) -> s
     candidates: list[str] = []
 
     for item in vocab.terms:
-        norm = _normalize_spaces(item)
+        norm = _normalize_spaces(item).rstrip("*")
         if not norm:
             continue
         key = norm.casefold()
@@ -81,7 +81,7 @@ def build_whisper_initial_prompt(base_prompt: str, vocab: ParsedVocabulary) -> s
             candidates.append(norm)
 
     for _src, dst in vocab.replacements:
-        norm = _normalize_spaces(dst)
+        norm = _normalize_spaces(dst).rstrip("*")
         if not norm:
             continue
         key = norm.casefold()
@@ -110,14 +110,21 @@ def build_whisper_initial_prompt(base_prompt: str, vocab: ParsedVocabulary) -> s
     return terms_block
 
 
-def format_vocabulary_for_llm(vocab: ParsedVocabulary) -> str:
+def format_vocabulary_for_llm(
+    vocab: ParsedVocabulary,
+    *,
+    lang: str | None = None,
+) -> str:
     """Format personal terms and replacement rules concisely for LLM system prompt."""
+    is_en = (lang or "").strip().lower().startswith("en")
     lines: list[str] = []
     if vocab.terms:
-        lines.append(f"Предпочитаемые термины и написание: {', '.join(vocab.terms)}.")
+        prefix = "Preferred terms & spelling" if is_en else "Предпочитаемые термины и написание"
+        lines.append(f"{prefix}: {', '.join(vocab.terms)}.")
     if vocab.replacements:
         rules = "; ".join(f'"{src}" -> "{dst}"' for src, dst in vocab.replacements)
-        lines.append(f"Обязательные автозамены: {rules}.")
+        prefix = "Mandatory replacements" if is_en else "Обязательные автозамены"
+        lines.append(f"{prefix}: {rules}.")
     return "\n".join(lines)
 
 
@@ -131,13 +138,13 @@ def _apply_case_rule(matched: str, dst: str) -> str:
     return dst
 
 
-def apply_vocabulary_replacements(
+def apply_vocabulary_replacements_with_count(
     text: str,
     replacements: Sequence[tuple[str, str]],
-) -> str:
-    """Apply whole-word case-insensitive replacements in a single longest-match pass."""
+) -> tuple[str, int]:
+    """Apply whole-word (or prefix-wildcard `*`) case-insensitive replacements and return `(new_text, count)`."""
     if not text or not replacements:
-        return text
+        return (text, 0)
 
     deduped: list[tuple[str, str]] = []
     seen_sources: set[str] = set()
@@ -153,19 +160,54 @@ def apply_vocabulary_replacements(
         deduped.append((src, dst))
 
     if not deduped:
-        return text
+        return (text, 0)
 
     deduped.sort(key=lambda pair: len(pair[0]), reverse=True)
-    lookup = {src.casefold(): dst for src, dst in deduped}
-    patterns = [r"\s+".join(re.escape(part) for part in src.split()) for src, _dst in deduped]
+    exact_lookup: dict[str, str] = {}
+    prefix_rules: list[tuple[str, str]] = []
+    patterns: list[str] = []
+
+    for src, dst in deduped:
+        if src.endswith("*") and len(src) > 1:
+            stem = src[:-1]
+            stem_pat = r"\s+".join(re.escape(part) for part in stem.split()) + r"\w*"
+            patterns.append(stem_pat)
+            prefix_rules.append((stem.casefold(), dst))
+        else:
+            patterns.append(r"\s+".join(re.escape(part) for part in src.split()))
+            exact_lookup[src.casefold()] = dst
+
     combined = re.compile(r"(?<!\w)(?:" + "|".join(patterns) + r")(?!\w)", re.IGNORECASE)
+    fix_count = 0
 
     def _replace(match: re.Match[str]) -> str:
+        nonlocal fix_count
         matched = match.group(0)
-        key = _normalize_spaces(matched).casefold()
-        dst = lookup.get(key)
-        if dst is None:
-            return matched
-        return _apply_case_rule(matched, dst)
+        norm = _normalize_spaces(matched)
+        key = norm.casefold()
 
-    return combined.sub(_replace, text)
+        dst = exact_lookup.get(key)
+        if dst is not None:
+            fix_count += 1
+            return _apply_case_rule(matched, dst)
+
+        for stem_key, raw_dst in prefix_rules:
+            if key.startswith(stem_key):
+                suffix = norm[len(stem_key) :]
+                target = (raw_dst[:-1] + suffix) if raw_dst.endswith("*") else raw_dst
+                fix_count += 1
+                return _apply_case_rule(matched, target)
+
+        return matched
+
+    result = combined.sub(_replace, text)
+    return (result, fix_count)
+
+
+def apply_vocabulary_replacements(
+    text: str,
+    replacements: Sequence[tuple[str, str]],
+) -> str:
+    """Apply whole-word case-insensitive replacements in a single longest-match pass."""
+    result, _count = apply_vocabulary_replacements_with_count(text, replacements)
+    return result

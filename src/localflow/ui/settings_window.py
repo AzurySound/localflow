@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import difflib
+import html
 import threading
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
@@ -70,10 +72,12 @@ from localflow.llm.model_catalog import (
     is_llama_runtime_installed,
     is_model_downloaded,
 )
+from localflow.llm.embedded_polisher import EmbeddedLlamaPolisher
 from localflow.llm.ollama_polisher import OllamaPolisher
 from localflow.storage import HistoryStorage
 from localflow.styles import (
     DEFAULT_CATEGORY_STYLES,
+    STYLE_PROFILES,
     format_app_style_overrides,
     get_default_style_instruction,
     get_style_choice_items,
@@ -81,6 +85,7 @@ from localflow.styles import (
     is_builtin_style_instruction,
     parse_app_style_overrides,
 )
+from localflow.vocabulary import parse_vocabulary
 from localflow.ui.insights_page import InsightsPage
 from localflow.ui.theme import (
     ResolvedTheme,
@@ -235,6 +240,8 @@ class SettingsWindow(QWidget):
     _download_progress = Signal(object)
     _download_finished = Signal(str, bool)  # model_id, also_switch_whisper
     _download_failed = Signal(str)
+    _rerun_finished = Signal(int, object)  # entry_id, PolishResult
+    _rerun_failed = Signal(int, str)  # entry_id, error
 
     def __init__(self, config: AppConfig, storage: HistoryStorage) -> None:
         super().__init__()
@@ -259,6 +266,8 @@ class SettingsWindow(QWidget):
         self._download_progress.connect(self._on_download_progress)
         self._download_finished.connect(self._on_download_finished)
         self._download_failed.connect(self._on_download_failed)
+        self._rerun_finished.connect(self._on_rerun_cleanup_finished)
+        self._rerun_failed.connect(self._on_rerun_cleanup_failed)
 
         self.setWindowTitle(tr("window.title", self._lang))
         self.setWindowIcon(_build_window_icon())
@@ -778,6 +787,14 @@ class SettingsWindow(QWidget):
         copy_btn.clicked.connect(self._copy_selected_history)
         ins_layout.addWidget(copy_btn)
 
+        self._rerun_cleanup_btn = QPushButton(tr("history.rerun_cleanup", self._lang))
+        self._rerun_cleanup_btn.setObjectName("secondaryBtn")
+        self._rerun_cleanup_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rerun_cleanup_btn.setEnabled(False)
+        self._bind_text(self._rerun_cleanup_btn, "history.rerun_cleanup")
+        self._rerun_cleanup_btn.clicked.connect(self._rerun_selected_cleanup)
+        ins_layout.addWidget(self._rerun_cleanup_btn)
+
         root.addWidget(inspector)
         return w
 
@@ -916,6 +933,7 @@ class SettingsWindow(QWidget):
 
         if count == 0:
             self._raw_preview.clear()
+            self._rerun_cleanup_btn.setEnabled(False)
             self._inspector_title.setText(tr("history.inspector_title", self._lang))
             self._inspector_meta.setText(tr("history.inspector_empty_meta", self._lang))
             return
@@ -924,6 +942,7 @@ class SettingsWindow(QWidget):
             entries = [item.data(Qt.ItemDataRole.UserRole) for item in selected]
             total_sec = sum(e.duration_sec for e in entries)
             total_words = sum(len(tokenize_words(e.final_text)) for e in entries)
+            self._rerun_cleanup_btn.setEnabled(False)
             self._inspector_title.setText(tr("history.multi_title", self._lang, count=count))
             self._inspector_meta.setText(
                 tr("history.multi_meta", self._lang, words=total_words, sec=total_sec)
@@ -938,10 +957,12 @@ class SettingsWindow(QWidget):
             return
         if current is None:
             self._raw_preview.clear()
+            self._rerun_cleanup_btn.setEnabled(False)
             self._inspector_title.setText(tr("history.inspector_title", self._lang))
             self._inspector_meta.setText(tr("history.inspector_empty_meta", self._lang))
             return
         entry = current.data(Qt.ItemDataRole.UserRole)
+        self._rerun_cleanup_btn.setEnabled(bool(not entry.is_command and entry.raw_text.strip()))
         try:
             dt = datetime.fromisoformat(entry.created_at).astimezone()
             ts = dt.strftime("%d.%m.%Y · %H:%M")
@@ -964,9 +985,179 @@ class SettingsWindow(QWidget):
         if style_lbl:
             meta_bits.append(tr("history.meta_style", self._lang, label=style_lbl))
         self._inspector_meta.setText(" · ".join(meta_bits))
-        self._raw_preview.setPlainText(
-            tr("history.preview_body", self._lang, final=entry.final_text, raw=entry.raw_text)
+        if not entry.is_command and entry.raw_text.strip() != entry.final_text.strip():
+            self._raw_preview.setHtml(
+                self.format_history_inspector_html(
+                    entry.raw_text,
+                    entry.final_text,
+                    lang=self._lang,
+                    theme=self._resolved_theme,
+                )
+            )
+        else:
+            self._raw_preview.setPlainText(
+                tr("history.preview_body", self._lang, final=entry.final_text, raw=entry.raw_text)
+            )
+
+    @staticmethod
+    def format_history_inspector_html(
+        raw_text: str,
+        final_text: str,
+        *,
+        lang: str,
+        theme: str,
+    ) -> str:
+        """Render Final text, inline word-level diff, and Raw ASR as clean themed HTML."""
+        is_light = theme == "light"
+        hdr_color = "#52525b" if is_light else "#a1a1aa"
+        body_color = "#111113" if is_light else "#f4f4f5"
+        del_bg = "#fee2e2" if is_light else "#451a1a"
+        del_fg = "#b91c1c" if is_light else "#fca5a5"
+        ins_bg = "#dcfce7" if is_light else "#143322"
+        ins_fg = "#15803d" if is_light else "#86efac"
+
+        raw_tokens = raw_text.split()
+        final_tokens = final_text.split()
+        matcher = difflib.SequenceMatcher(None, raw_tokens, final_tokens, autojunk=False)
+        diff_parts: list[str] = []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                diff_parts.append(html.escape(" ".join(final_tokens[j1:j2])))
+            elif tag in ("replace", "delete"):
+                removed = html.escape(" ".join(raw_tokens[i1:i2]))
+                diff_parts.append(
+                    f'<span style="background:{del_bg};color:{del_fg};text-decoration:line-through;">'
+                    f"{removed}</span>"
+                )
+                if tag == "replace":
+                    added = html.escape(" ".join(final_tokens[j1:j2]))
+                    diff_parts.append(
+                        f'<span style="background:{ins_bg};color:{ins_fg};">{added}</span>'
+                    )
+            elif tag == "insert":
+                added = html.escape(" ".join(final_tokens[j1:j2]))
+                diff_parts.append(
+                    f'<span style="background:{ins_bg};color:{ins_fg};">{added}</span>'
+                )
+
+        diff_html = " ".join(p for p in diff_parts if p)
+        final_label = "Итоговый текст:" if lang == "ru" else "Final text:"
+        raw_label = "Сырой ASR:" if lang == "ru" else "Raw ASR:"
+        diff_label = tr("history.diff_label", lang) + ":"
+
+        return (
+            f'<div style="color:{body_color};font-size:12.5px;line-height:1.45;">'
+            f'<div style="color:{hdr_color};font-weight:600;margin-bottom:2px;">{html.escape(final_label)}</div>'
+            f'<div style="margin-bottom:10px;">{html.escape(final_text)}</div>'
+            f'<div style="color:{hdr_color};font-weight:600;margin-bottom:2px;">{html.escape(diff_label)}</div>'
+            f'<div style="margin-bottom:10px;">{diff_html}</div>'
+            f'<div style="color:{hdr_color};font-weight:600;margin-bottom:2px;">{html.escape(raw_label)}</div>'
+            f"<div>{html.escape(raw_text)}</div>"
+            f"</div>"
         )
+
+    def _rerun_selected_cleanup(self) -> None:
+        item = self._history_list.currentItem()
+        if item is None:
+            return
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        if entry is None or entry.is_command or not entry.raw_text.strip():
+            return
+
+        self._rerun_cleanup_btn.setEnabled(False)
+        self._rerun_cleanup_btn.setText(tr("history.rerun_busy", self._lang))
+        cfg = self._config
+        lang = self._lang
+        entry_id = int(entry.id)
+        raw_text = entry.raw_text
+        style_key = entry.style_profile if entry.style_profile in STYLE_PROFILES else "default"
+        base_profile = STYLE_PROFILES[style_key]  # type: ignore[index]
+        custom_instr = (cfg.style_custom_instructions or {}).get(style_key, "").strip()
+        if custom_instr:
+            from localflow.styles import StyleProfile
+
+            style_profile = StyleProfile(
+                key=base_profile.key,
+                label=base_profile.label,
+                pill_label=base_profile.pill_label,
+                use_llm=True,
+                temperature=base_profile.temperature,
+                strip_trailing_period=base_profile.strip_trailing_period,
+                instruction=custom_instr,
+            )
+        elif not base_profile.use_llm:
+            style_profile = STYLE_PROFILES["default"]
+        else:
+            style_profile = base_profile
+
+        def _work() -> None:
+            vocab = parse_vocabulary(cfg.custom_vocabulary)
+            if cfg.llm_backend == "embedded":
+                polisher = EmbeddedLlamaPolisher(
+                    model_id=cfg.embedded_llm_model_id,
+                    custom_model_path=cfg.embedded_llm_custom_path,
+                    system_prompt=cfg.llm_system_prompt,
+                    timeout_sec=cfg.ollama_timeout_sec,
+                    keep_alive=cfg.ollama_keep_alive,
+                    num_ctx=cfg.ollama_num_ctx,
+                    num_gpu=cfg.ollama_num_gpu,
+                    vocabulary=vocab,
+                    lang=lang,
+                )
+            else:
+                polisher = OllamaPolisher(
+                    base_url=cfg.ollama_url,
+                    model=cfg.ollama_model,
+                    system_prompt=cfg.llm_system_prompt,
+                    timeout_sec=cfg.ollama_timeout_sec,
+                    keep_alive=cfg.ollama_keep_alive,
+                    num_ctx=cfg.ollama_num_ctx,
+                    num_gpu=cfg.ollama_num_gpu,
+                    vocabulary=vocab,
+                    lang=lang,
+                )
+            try:
+                res = polisher.polish(raw_text, style_profile=style_profile)
+                if res.error and not res.used_llm:
+                    self._rerun_failed.emit(entry_id, res.error)
+                else:
+                    self._rerun_finished.emit(entry_id, res)
+            except Exception as exc:
+                self._rerun_failed.emit(entry_id, str(exc))
+            finally:
+                polisher.close()
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_rerun_cleanup_finished(self, entry_id: int, res: object) -> None:
+        self._rerun_cleanup_btn.setText(tr("history.rerun_cleanup", self._lang))
+        from localflow.llm.ollama_polisher import PolishResult
+
+        if isinstance(res, PolishResult):
+            model_name = (
+                self._config.embedded_llm_model_id
+                if self._config.llm_backend == "embedded"
+                else self._config.ollama_model
+            )
+            self._storage.update_entry_cleanup(
+                entry_id,
+                final_text=res.text,
+                llm_model=model_name if res.used_llm else None,
+                used_llm=res.used_llm,
+            )
+            self.refresh_history()
+            for row in range(self._history_list.count()):
+                it = self._history_list.item(row)
+                ent = it.data(Qt.ItemDataRole.UserRole) if it is not None else None
+                if ent is not None and int(ent.id) == entry_id:
+                    self._history_list.setCurrentRow(row)
+                    break
+        self._rerun_cleanup_btn.setEnabled(True)
+
+    def _on_rerun_cleanup_failed(self, _entry_id: int, err: str) -> None:
+        self._rerun_cleanup_btn.setText(tr("history.rerun_cleanup", self._lang))
+        self._rerun_cleanup_btn.setEnabled(True)
+        QMessageBox.warning(self, tr("history.rerun_cleanup", self._lang), err)
 
     def _on_history_context_menu(self, pos) -> None:
         item = self._history_list.itemAt(pos)
