@@ -20,6 +20,7 @@ from localflow.llm.ollama_polisher import (
     _normalize_vocabulary,
     build_polish_system_prompt,
     format_polish_user_message,
+    strip_long_dashes,
     strip_transcript_wrapper,
     validate_polish_output,
 )
@@ -259,6 +260,7 @@ class EmbeddedLlamaPolisher:
                     content = replaced
             if effective_style is not None:
                 content = apply_style_postprocessing(content, effective_style)
+            content = strip_long_dashes(content)
             return PolishResult(text=content, used_llm=True)
         except Exception as exc:
             return PolishResult(text=prepared_text, used_llm=False, error=str(exc))
@@ -301,6 +303,7 @@ class EmbeddedLlamaPolisher:
                 content = raw_content.strip("\r\n")
             else:
                 content = raw_content.strip()
+            content = strip_long_dashes(content)
             return PolishResult(text=content, used_llm=True)
         except Exception as exc:
             return PolishResult(text="", used_llm=False, error=str(exc))

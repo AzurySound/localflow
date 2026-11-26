@@ -383,7 +383,7 @@ class TestWin32TextInjectorOverwrite(unittest.TestCase):
         self.assertEqual(len(h.modifiers_during_v), 1)
 
     def test_inject_auto_space_true_peeks_and_prepends_space(self) -> None:
-        h = FakeWin32Harness(initial_clipboard="before")
+        h = FakeWin32Harness(initial_clipboard="before", copy_succeeds=False)
         h.left_char = "."
         ok = h.make_injector().inject("привет", auto_space=True, restore_clipboard=True)
         self.assertTrue(ok)
@@ -402,6 +402,43 @@ class TestWin32TextInjectorOverwrite(unittest.TestCase):
         ok = h.make_injector().inject("hello", auto_space=False)
         self.assertFalse(ok)
         self.assertEqual(h.sent_batches, [])
+
+    def test_inject_auto_space_with_active_selection_replaces_without_collapsing(self) -> None:
+        h = FakeWin32Harness(
+            initial_clipboard="before",
+            selected_text="old selection",
+            copy_succeeds=True,
+        )
+        h.left_char = "."
+        ok = h.make_injector().inject("replacement", auto_space=True, restore_clipboard=True)
+        self.assertTrue(ok)
+        self.assertEqual(h.peek_calls, 0)
+        self.assertEqual(h.set_clipboard_calls, ["replacement", "before"])
+        self.assertEqual(h.clipboard_text, "before")
+        # Must never send arrow keys or Shift that would collapse the active selection
+        sent_vks = {vk for batch in h.sent_batches for vk, _ in batch}
+        self.assertNotIn(VK_LEFT, sent_vks)
+        self.assertNotIn(VK_RIGHT, sent_vks)
+        self.assertNotIn(VK_LSHIFT, sent_vks)
+        self.assertIn(VK_C, sent_vks)
+        self.assertIn(VK_V, sent_vks)
+
+    def test_inject_auto_space_without_selection_peeks_and_prepends_space(self) -> None:
+        h = FakeWin32Harness(initial_clipboard="before", copy_succeeds=False)
+        h.left_char = "."
+        ok = h.make_injector().inject("привет", auto_space=True, restore_clipboard=True)
+        self.assertTrue(ok)
+        self.assertEqual(h.peek_calls, 1)
+        self.assertEqual(h.set_clipboard_calls, [" привет", "before"])
+
+    def test_inject_terminal_uses_ctrl_insert_instead_of_ctrl_c(self) -> None:
+        h = FakeWin32Harness(initial_clipboard="before", copy_succeeds=False)
+        h.left_char = " "
+        ok = h.make_injector().inject("ls", auto_space=True, restore_clipboard=True, is_terminal=True)
+        self.assertTrue(ok)
+        sent_vks = {vk for batch in h.sent_batches for vk, _ in batch}
+        self.assertIn(VK_INSERT, sent_vks)
+        self.assertNotIn(VK_C, sent_vks)
 
 
 class TestCaptureSelectedTextWrapper(unittest.TestCase):

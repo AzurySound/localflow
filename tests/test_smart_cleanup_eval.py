@@ -218,3 +218,143 @@ def test_context_menu_copy_raw_asr_visibility_and_callback(qapp) -> None:
     assert len(raw_actions) == 1
     raw_actions[0].trigger()
     assert copied == ["raw"]
+
+
+def test_strip_long_dashes_and_prompts_have_no_long_dashes() -> None:
+    from localflow.config import DEFAULT_LLM_SYSTEM_PROMPT_RU
+    from localflow.llm.ollama_polisher import strip_long_dashes
+    from localflow.styles import DEFAULT_STYLE_INSTRUCTIONS_EN, DEFAULT_STYLE_INSTRUCTIONS_RU
+
+    assert strip_long_dashes("Привет — это тест.") == "Привет - это тест."
+    assert strip_long_dashes("Во-первых, — сделай это.") == "Во-первых, сделай это."
+    assert strip_long_dashes("Сроки 1–2 дня и шаги 3―4.") == "Сроки 1-2 дня и шаги 3-4."
+    assert strip_long_dashes("word—word") == "word - word"
+    assert strip_long_dashes("Обычный дефис - остаётся.") == "Обычный дефис - остаётся."
+
+    for text in (
+        DEFAULT_LLM_SYSTEM_PROMPT_EN,
+        DEFAULT_LLM_SYSTEM_PROMPT_RU,
+        *DEFAULT_STYLE_INSTRUCTIONS_EN.values(),
+        *DEFAULT_STYLE_INSTRUCTIONS_RU.values(),
+    ):
+        assert "—" not in text
+        assert "–" not in text
+
+
+def test_polishers_strip_long_dashes_in_polish_and_transform() -> None:
+    def ollama_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"message": {"content": "Сделай кнопку синей — и проверь 1–2 теста."}},
+        )
+
+    ol = OllamaPolisher(client=httpx.Client(transport=httpx.MockTransport(ollama_handler)))
+    res_p = ol.polish("ну сделай кнопку синей и проверь один два теста в форме сейчас")
+    assert res_p.used_llm is True
+    assert "—" not in res_p.text and "–" not in res_p.text
+    assert res_p.text == "Сделай кнопку синей - и проверь 1-2 теста."
+
+    res_t = ol.transform_selection("текст", "сократи")
+    assert res_t.used_llm is True
+    assert res_t.text == "Сделай кнопку синей - и проверь 1-2 теста."
+
+    fake_mgr = SimpleNamespace(
+        ensure_started=lambda: "http://127.0.0.1:9999",
+        touch_activity=lambda: None,
+    )
+
+    def emb_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "Итог, — готово 2–3 пункта."}}]},
+        )
+
+    emb = EmbeddedLlamaPolisher(
+        server_manager=fake_mgr,  # type: ignore[arg-type]
+        client=httpx.Client(transport=httpx.MockTransport(emb_handler)),
+    )
+    emb_res = emb.polish("в общем итог готово два три пункта для релиза сейчас")
+    assert emb_res.used_llm is True
+    assert emb_res.text == "Итог, готово 2-3 пункта."
+
+
+def test_ollama_is_reachable() -> None:
+    ok_client = httpx.Client(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"version": "0.6.0"}))
+    )
+    assert OllamaPolisher(client=ok_client).is_reachable() is True
+
+    def _fail(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    bad_client = httpx.Client(transport=httpx.MockTransport(_fail))
+    assert OllamaPolisher(client=bad_client).is_reachable() is False
+
+
+def test_first_dictation_prompts_to_start_ollama_when_unreachable(
+    tmp_path: Path, monkeypatch, qapp, qtbot
+) -> None:
+    from localflow.app import AppState
+    from test_controller_e2e import _ControllerHarness
+
+    harness = _ControllerHarness(tmp_path, monkeypatch)
+    cfg = AppConfig(
+        llm_enabled=True,
+        llm_backend="ollama",
+        ollama_model="gemma4:e4b",
+        ollama_warmup_on_start=False,
+    )
+    ctrl = harness.create_controller(qapp, qtbot, initial_config=cfg)
+    try:
+        reachable = False
+        prompt_choices: list[str] = ["cancel", "continue"]
+        prompt_calls = 0
+        launched: list[list[str]] = []
+
+        monkeypatch.setattr(ctrl._polisher, "is_reachable", lambda timeout=0.5: reachable)
+        monkeypatch.setattr("localflow.app.find_ollama_launch_command", lambda: ["ollama", "serve"])
+        monkeypatch.setattr(
+            "localflow.app.launch_ollama_background",
+            lambda cmd=None: launched.append(list(cmd or [])) or True,
+        )
+
+        def _fake_prompt(*, can_launch: bool) -> str:
+            nonlocal prompt_calls
+            prompt_calls += 1
+            assert can_launch is True
+            return prompt_choices.pop(0)
+
+        monkeypatch.setattr(ctrl, "_prompt_start_ollama", _fake_prompt)
+
+        # 1. Cancel keeps IDLE and does not suppress re-prompting on next attempt
+        ctrl._hotkey.toggle_requested.emit()
+        assert prompt_calls == 1
+        assert ctrl._state == AppState.IDLE
+
+        # 2. Continue starts recording immediately and suppresses subsequent prompts
+        ctrl._hotkey.toggle_requested.emit()
+        assert prompt_calls == 2
+        assert ctrl._state == AppState.RECORDING
+        ctrl._hotkey.cancel_requested.emit()
+        assert ctrl._state == AppState.IDLE
+
+        ctrl._hotkey.toggle_requested.emit()
+        assert prompt_calls == 2
+        assert ctrl._state == AppState.RECORDING
+        ctrl._hotkey.cancel_requested.emit()
+
+        # 3. Reset flag -> Start launches Ollama in background and notifies when reachable
+        ctrl._ollama_start_prompted = False
+        prompt_choices.append("start")
+
+        def _become_reachable(timeout: float = 0.5) -> bool:
+            return bool(launched)
+
+        monkeypatch.setattr(ctrl._polisher, "is_reachable", _become_reachable)
+        ctrl._hotkey.toggle_requested.emit()
+        assert prompt_calls == 3
+        assert launched == [["ollama", "serve"]]
+        assert ctrl._state == AppState.IDLE
+        qtbot.waitUntil(lambda: "ready" in ctrl._pill._notice_text.lower(), timeout=4000)
+    finally:
+        ctrl.shutdown()

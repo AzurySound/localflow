@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
+import time
 
 import numpy as np
 from PySide6.QtCore import QObject, QPoint, QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from localflow.asr.chunked_session import ChunkedASRSession
 from localflow.asr.whisper_engine import ASRStatus, WhisperEngine
@@ -33,7 +34,14 @@ from localflow.llm.downloader import (
     get_whisper_model_dir,
 )
 from localflow.llm.embedded_polisher import EmbeddedLlamaPolisher
-from localflow.llm.ollama_polisher import OllamaPolisher, should_bypass_llm
+from localflow.llm.ollama_polisher import (
+    OllamaPolisher,
+    find_ollama_launch_command,
+    is_local_ollama_url,
+    launch_ollama_background,
+    should_bypass_llm,
+    strip_long_dashes,
+)
 from localflow.storage import HistoryStorage
 from localflow.styles import apply_style_postprocessing, resolve_style_profile
 from localflow.ui.context_menu import QuickMenuCallbacks, QuickMenuState, build_quick_menu
@@ -90,6 +98,7 @@ class LocalFlowController(QObject):
     _profile_ready = Signal(str, object)  # profile, available_models (or None)
     _partial_text_ready = Signal(int, str)  # session_gen, partial_text
     _auto_stop_requested = Signal(int)  # session_gen
+    _ollama_start_status = Signal(bool, str)  # ready_ok, notice_text
 
     def __init__(self, app: QApplication) -> None:
         super().__init__()
@@ -110,6 +119,7 @@ class LocalFlowController(QObject):
         self._asr_status_obj: ASRStatus | None = None
         self._asr_downloading = False
         self._asr_download_pct = -1
+        self._ollama_start_prompted = False
         self._asr_status_text = tr("menu.asr_loading_model", self._lang, model=self._config.whisper_model)
         recent = self._storage.list_recent(limit=1)
         self._last_dictation_text: str = recent[0].final_text if recent else ""
@@ -283,6 +293,9 @@ class LocalFlowController(QObject):
         self._auto_stop_requested.connect(
             self._on_auto_stop, Qt.ConnectionType.QueuedConnection
         )
+        self._ollama_start_status.connect(
+            self._on_ollama_start_status, Qt.ConnectionType.QueuedConnection
+        )
 
         self._tray.open_settings_requested.connect(self._settings.show_and_focus)
         self._tray.toggle_llm_requested.connect(self._on_toggle_llm_from_tray)
@@ -425,6 +438,7 @@ class LocalFlowController(QObject):
         was_downloading = self._asr_downloading
         self._asr_downloading = False
         self._asr_download_pct = -1
+        self._ollama_start_prompted = False
         self._settings.clear_external_download()
         self._asr_status_kind = "ready"
         self._asr_status_obj = status
@@ -439,6 +453,7 @@ class LocalFlowController(QObject):
             return
         self._asr_downloading = False
         self._asr_download_pct = -1
+        self._ollama_start_prompted = False
         self._settings.clear_external_download()
         self._asr_status_kind = "error"
         self._asr_status_obj = None
@@ -524,6 +539,96 @@ class LocalFlowController(QObject):
         elif self._state == AppState.RECORDING:
             self._stop_and_process()
 
+    def _prompt_start_ollama(self, *, can_launch: bool) -> str:
+        """Show a topmost modal prompt asking the user to start Ollama."""
+        box = QMessageBox()
+        box.setWindowTitle(tr("ollama_prompt.title", self._lang))
+        box.setText(
+            tr(
+                "ollama_prompt.body",
+                self._lang,
+                model=self._config.ollama_model,
+                url=self._config.ollama_url,
+            )
+        )
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowFlags(box.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        start_btn = (
+            box.addButton(tr("ollama_prompt.btn_start", self._lang), QMessageBox.ButtonRole.AcceptRole)
+            if can_launch
+            else None
+        )
+        continue_btn = box.addButton(
+            tr("ollama_prompt.btn_continue", self._lang), QMessageBox.ButtonRole.ActionRole
+        )
+        box.addButton(tr("ollama_prompt.btn_cancel", self._lang), QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if start_btn is not None and clicked == start_btn:
+            return "start"
+        if clicked == continue_btn:
+            return "continue"
+        return "cancel"
+
+    def _on_ollama_start_status(self, ready_ok: bool, msg: str) -> None:
+        if self._state == AppState.IDLE:
+            self._pill.show_notice(msg, is_error=not ready_ok, duration_ms=2600)
+
+    def _check_ollama_ready_on_first_dictation(self) -> bool:
+        """On first dictation with Ollama selected, prompt to start Ollama if unreachable."""
+        if self._ollama_start_prompted:
+            return True
+        if not self._config.llm_enabled or self._config.llm_backend != "ollama":
+            return True
+        if not self._config.ollama_model.strip():
+            return True
+        if not hasattr(self._polisher, "is_reachable"):
+            return True
+
+        if self._polisher.is_reachable(timeout=0.5):
+            self._ollama_start_prompted = True
+            return True
+
+        launch_cmd = (
+            find_ollama_launch_command()
+            if is_local_ollama_url(self._config.ollama_url)
+            else None
+        )
+        choice = self._prompt_start_ollama(can_launch=launch_cmd is not None)
+        if choice == "continue":
+            self._ollama_start_prompted = True
+            return True
+        if choice != "start" or launch_cmd is None:
+            return False
+
+        self._ollama_start_prompted = True
+        if not launch_ollama_background(launch_cmd):
+            self._pill.show_notice(
+                tr("notice.ollama_start_failed", self._lang), is_error=True, duration_ms=2600
+            )
+            return False
+
+        self._pill.show_notice(tr("notice.ollama_starting", self._lang), duration_ms=6000)
+        polisher = self._polisher
+        lang = self._lang
+
+        def _wait_ready() -> None:
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline and not self._shutting_down:
+                if polisher.is_reachable(timeout=0.5):
+                    try:
+                        polisher.warmup()
+                    except Exception:
+                        pass
+                    self._ollama_start_status.emit(True, tr("notice.ollama_ready", lang))
+                    return
+                time.sleep(0.5)
+            if not self._shutting_down:
+                self._ollama_start_status.emit(False, tr("notice.ollama_start_failed", lang))
+
+        self._pool.start(_FnWorker(_wait_ready))
+        return False
+
     def _on_command_toggle(self) -> None:
         if self._state != AppState.IDLE:
             return
@@ -536,6 +641,8 @@ class LocalFlowController(QObject):
                 self._pill.show_notice(
                     tr("notice.model_loading", self._lang), is_error=True, duration_ms=1800
                 )
+            return
+        if not self._check_ollama_ready_on_first_dictation():
             return
 
         window_ctx = self._safe_get_active_window_context()
@@ -612,6 +719,8 @@ class LocalFlowController(QObject):
                 self._pill.show_notice(
                     tr("notice.model_loading", self._lang), is_error=True, duration_ms=1800
                 )
+            return
+        if not self._check_ollama_ready_on_first_dictation():
             return
 
         window_ctx = self._safe_get_active_window_context()
@@ -815,14 +924,28 @@ class LocalFlowController(QObject):
                             final_text = replaced
                     if cfg.llm_enabled and active_style.use_llm:
                         final_text = apply_style_postprocessing(final_text, active_style)
+                        final_text = strip_long_dashes(final_text)
 
-                self._stage_injecting.emit()
-                injector.inject(
-                    final_text,
-                    auto_space=True,
-                    restore_clipboard=cfg.paste_restore_clipboard,
-                    paste_delay_ms=cfg.paste_delay_ms,
+                is_term = bool(
+                    window_ctx is not None
+                    and window_ctx.app_name in ("Terminal", "PowerShell", "Command Prompt")
                 )
+                self._stage_injecting.emit()
+                try:
+                    injector.inject(
+                        final_text,
+                        auto_space=True,
+                        restore_clipboard=cfg.paste_restore_clipboard,
+                        paste_delay_ms=cfg.paste_delay_ms,
+                        is_terminal=is_term,
+                    )
+                except TypeError:
+                    injector.inject(
+                        final_text,
+                        auto_space=True,
+                        restore_clipboard=cfg.paste_restore_clipboard,
+                        paste_delay_ms=cfg.paste_delay_ms,
+                    )
                 storage.add_entry(
                     duration_sec=duration_sec,
                     raw_text=raw_text,
@@ -990,6 +1113,8 @@ class LocalFlowController(QObject):
         self._restore_pill_idle()
 
     def _on_toggle_llm_from_tray(self, enabled: bool) -> None:
+        if enabled:
+            self._ollama_start_prompted = False
         self._config = self._config.model_copy(update={"llm_enabled": enabled})
         save_config(self._config)
         self._tray.set_llm_checked(enabled)
@@ -1044,6 +1169,12 @@ class LocalFlowController(QObject):
         )
 
         self._config = new_cfg
+        if (
+            (new_cfg.llm_enabled and not old_cfg.llm_enabled)
+            or new_cfg.llm_backend != old_cfg.llm_backend
+            or new_cfg.ollama_url != old_cfg.ollama_url
+        ):
+            self._ollama_start_prompted = False
         save_config(new_cfg)
         if new_cfg.autostart_enabled != old_cfg.autostart_enabled:
             set_autostart_enabled(new_cfg.autostart_enabled)

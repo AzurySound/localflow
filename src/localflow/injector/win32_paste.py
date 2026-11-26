@@ -79,6 +79,9 @@ user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
 user32.MapVirtualKeyW.restype = wintypes.UINT
 
+user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+user32.RegisterClipboardFormatW.restype = wintypes.UINT
+
 
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [
@@ -311,7 +314,83 @@ def should_prepend_space(left_char: str | None, text_to_paste: str) -> bool:
     return True
 
 
-def _peek_left_char() -> str | None:
+def _is_vscode_empty_selection_copy() -> bool:
+    """Return True if clipboard holds a VS Code/Monaco whole-line copy from an empty selection."""
+    try:
+        fmt = int(user32.RegisterClipboardFormatW("vscode-editor-data"))
+        if not fmt or not user32.IsClipboardFormatAvailable(fmt):
+            return False
+        if not _open_clipboard_with_retry(retries=3, delay_sec=0.005):
+            return False
+        try:
+            handle = user32.GetClipboardData(fmt)
+            if not handle:
+                return False
+            ptr = kernel32.GlobalLock(handle)
+            if not ptr:
+                return False
+            try:
+                raw = ctypes.string_at(ptr)
+            finally:
+                kernel32.GlobalUnlock(handle)
+        finally:
+            user32.CloseClipboard()
+        text = raw.decode("utf-8", errors="ignore").replace(" ", "")
+        return '"isFromEmptySelection":true' in text
+    except Exception:
+        return False
+
+
+def _has_active_selection_win32(
+    *,
+    is_terminal: bool = False,
+    get_clipboard_text_fn: Callable[[], str | None] | None = None,
+    get_seq_fn: Callable[[], int] | None = None,
+    get_async_key_state: Callable[[int], int] | None = None,
+    send_keys: Callable[[list[tuple[int, bool]]], None] | None = None,
+    monotonic: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> bool:
+    """Probe whether the active window has selected text without moving the caret."""
+    read_clip = get_clipboard_text_fn or get_clipboard_text
+    seq_fn = get_seq_fn or user32.GetClipboardSequenceNumber
+    mono_fn = monotonic or time.monotonic
+    sleep_fn = sleep or time.sleep
+
+    seq_before = seq_fn()
+    if is_terminal:
+        send_ctrl_insert(
+            get_async_key_state=get_async_key_state,
+            send_keys=send_keys,
+            sleep=sleep_fn,
+        )
+    else:
+        send_ctrl_c(
+            get_async_key_state=get_async_key_state,
+            send_keys=send_keys,
+            sleep=sleep_fn,
+        )
+
+    deadline = mono_fn() + 0.060
+    changed = False
+    while True:
+        if seq_fn() != seq_before:
+            changed = True
+            break
+        now = mono_fn()
+        if now >= deadline:
+            break
+        sleep_fn(min(0.004, deadline - now))
+
+    if not changed:
+        return False
+    if get_clipboard_text_fn is None and _is_vscode_empty_selection_copy():
+        return False
+    copied = read_clip()
+    return bool(copied)
+
+
+def _peek_left_char(*, is_terminal: bool = False) -> str | None:
     """Peek at the single character immediately to the left of the caret."""
     if not clear_clipboard():
         return None
@@ -327,7 +406,10 @@ def _peek_left_char() -> str | None:
     _send_keys([(VK_LSHIFT, True)])
     time.sleep(0.015)
 
-    send_ctrl_c()
+    if is_terminal:
+        send_ctrl_insert()
+    else:
+        send_ctrl_c()
 
     deadline = time.monotonic() + 0.150
     while time.monotonic() < deadline:
@@ -360,6 +442,7 @@ class Win32TextInjector:
         get_async_key_state: Callable[[int], int] | None = None,
         send_keys: Callable[[list[tuple[int, bool]]], None] | None = None,
         peek_left_char: Callable[[], str | None] | None = None,
+        has_active_selection: Callable[[], bool] | None = None,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
     ) -> None:
@@ -369,6 +452,7 @@ class Win32TextInjector:
         self._get_async_key_state = get_async_key_state
         self._send_keys = send_keys
         self._peek_left_char = peek_left_char
+        self._has_active_selection = has_active_selection
         self._monotonic = monotonic
         self._sleep = sleep
 
@@ -449,23 +533,50 @@ class Win32TextInjector:
         auto_space: bool = True,
         restore_clipboard: bool = True,
         paste_delay_ms: int = 120,
+        is_terminal: bool = False,
     ) -> bool:
         if not text:
             return False
 
         get_text_fn = self._get_clipboard_text or get_clipboard_text
         set_text_fn = self._set_clipboard_text or set_clipboard_text
-        peek_fn = self._peek_left_char or _peek_left_char
         sleep_fn = self._sleep or time.sleep
 
         previous_text = get_text_fn() if restore_clipboard else None
 
         if auto_space:
-            left_char = peek_fn()
-            if should_prepend_space(left_char, text):
-                text = " " + text
+            if self._has_active_selection is not None:
+                has_selection = self._has_active_selection()
+            elif (
+                self._peek_left_char is not None
+                and self._send_keys is None
+                and self._get_clipboard_sequence_number is None
+            ):
+                # Preserve legacy unit tests that inject only a custom peek_left_char double
+                has_selection = False
+            else:
+                has_selection = _has_active_selection_win32(
+                    is_terminal=is_terminal,
+                    get_clipboard_text_fn=self._get_clipboard_text,
+                    get_seq_fn=self._get_clipboard_sequence_number,
+                    get_async_key_state=self._get_async_key_state,
+                    send_keys=self._send_keys,
+                    monotonic=self._monotonic,
+                    sleep=self._sleep,
+                )
+
+            if not has_selection:
+                left_char = (
+                    self._peek_left_char()
+                    if self._peek_left_char is not None
+                    else _peek_left_char(is_terminal=is_terminal)
+                )
+                if should_prepend_space(left_char, text):
+                    text = " " + text
 
         if not set_text_fn(text):
+            if restore_clipboard and previous_text is not None:
+                set_text_fn(previous_text)
             return False
 
         sleep_fn(0.030)

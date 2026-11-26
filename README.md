@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/AzurySound/localflow/releases/latest">
-    <img src="https://img.shields.io/badge/Download-LocalFlow%20Setup%20(v0.2.2)-2563eb?style=for-the-badge&logo=windows&logoColor=white" alt="Download">
+    <img src="https://img.shields.io/badge/Download-LocalFlow%20Setup%20(v0.2.3)-2563eb?style=for-the-badge&logo=windows&logoColor=white" alt="Download">
   </a>
 </p>
 
@@ -19,7 +19,7 @@
   <img src="https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-blue?logo=windows" alt="Platform">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT License">
   <img src="https://img.shields.io/badge/Engine-faster--whisper%20%2B%20llama.cpp-violet" alt="Engine">
-  <img src="https://img.shields.io/badge/Tests-225%20passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/Tests-232%20passing-brightgreen" alt="Tests">
 </p>
 
 ---
@@ -68,7 +68,7 @@
 
 ## Quick Install
 
-1. Download **[LocalFlow-Setup-0.2.2.exe](https://github.com/AzurySound/localflow/releases/latest)** *(or the zero-install `LocalFlow-0.2.2-portable.zip`)*.
+1. Download **[LocalFlow-Setup-0.2.3.exe](https://github.com/AzurySound/localflow/releases/latest)** *(or the zero-install `LocalFlow-0.2.3-portable.zip`)*.
 2. Run the installer (installs per-user, no admin rights required).
 3. On first launch, download the recommended lightweight models in 1 click:
    - **Speech Recognition**: Whisper `small` (~460 MB) or `large-v3-turbo` (~1.6 GB).
@@ -105,7 +105,7 @@ uv run localflow
 ### Run Tests
 ```powershell
 uv run pytest -q
-# 225 passed, 41 subtests passed
+# 232 passed, 41 subtests passed
 ```
 
 ### Build Installer

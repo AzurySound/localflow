@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
+import sys
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
+from urllib.parse import urlparse
 
 import httpx
 
@@ -46,7 +52,8 @@ _TRANSFORM_SYSTEM_PROMPT = (
     "Rules:\n"
     "1. Interpret minor voice-recognition typos in <command> by intent (e.g. 'на форме как промпт' = 'оформи как промпт').\n"
     "2. If asked to condense/tighten ('ужми', 'сократи', 'condense', 'for prompt'), actively remove fluff and filler while keeping all key facts.\n"
-    "3. Keep original language unless translation is requested. Return ONLY the transformed text — no tags, quotes, or commentary."
+    "3. Never use long dashes ('—' or '–'); use commas, colons, or a short hyphen '-' instead.\n"
+    "4. Keep original language unless translation is requested. Return ONLY the transformed text: no tags, quotes, or commentary."
 )
 
 _KNOWN_CATEGORIES: frozenset[str] = frozenset(
@@ -85,6 +92,75 @@ _TRANSCRIPT_WRAPPER_RE = re.compile(
 def format_polish_user_message(text: str) -> str:
     """Wrap raw ASR transcript in explicit tags so small LLMs edit instead of continuing."""
     return f"<transcript>\n{text}\n</transcript>"
+
+
+_LONG_DASH_CHARS = "—–―‒"
+_COMMA_LONG_DASH_RE = re.compile(r",\s*[—–―‒]\s*")
+_DIGIT_LONG_DASH_RE = re.compile(r"(?<=\d)[—–―‒](?=\d)")
+_WORD_LONG_DASH_RE = re.compile(r"(?<=\w)[—―](?=\w)")
+_ANY_LONG_DASH_RE = re.compile(r"[—–―‒]")
+
+
+def strip_long_dashes(text: str) -> str:
+    """Replace long typographic dashes (—, –, ―, ‒) with commas or short hyphens (-)."""
+    if not text or not any(ch in text for ch in _LONG_DASH_CHARS):
+        return text
+    out = _COMMA_LONG_DASH_RE.sub(", ", text)
+    out = _DIGIT_LONG_DASH_RE.sub("-", out)
+    out = _WORD_LONG_DASH_RE.sub(" - ", out)
+    out = _ANY_LONG_DASH_RE.sub("-", out)
+    return out
+
+
+def is_local_ollama_url(url: str) -> bool:
+    """Return True when url points to localhost / loopback."""
+    try:
+        host = (urlparse(url).hostname or "").strip().lower()
+    except Exception:
+        return False
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def find_ollama_launch_command() -> list[str] | None:
+    """Locate the Ollama desktop app or CLI binary to start Ollama locally."""
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            app_exe = Path(local_app_data) / "Programs" / "Ollama" / "ollama app.exe"
+            if app_exe.is_file():
+                return [str(app_exe)]
+            cli_exe = Path(local_app_data) / "Programs" / "Ollama" / "ollama.exe"
+            if cli_exe.is_file():
+                return [str(cli_exe), "serve"]
+    which = shutil.which("ollama")
+    if which:
+        return [which, "serve"]
+    return None
+
+
+def launch_ollama_background(cmd: list[str] | None = None) -> bool:
+    """Start Ollama detached in the background; returns True if spawn succeeded."""
+    launch_cmd = cmd if cmd is not None else find_ollama_launch_command()
+    if not launch_cmd:
+        return False
+    kwargs: dict[str, object] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if sys.platform == "win32":
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) | getattr(
+            subprocess, "DETACHED_PROCESS", 0x00000008
+        )
+        if len(launch_cmd) > 1 and launch_cmd[1] == "serve":
+            flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        kwargs["creationflags"] = flags
+    try:
+        subprocess.Popen(launch_cmd, **kwargs)  # type: ignore[arg-type]
+        return True
+    except Exception:
+        return False
 
 
 def strip_transcript_wrapper(content: str) -> str:
@@ -289,6 +365,14 @@ class OllamaPolisher:
         models = data.get("models", [])
         return [str(m["name"]) for m in models if "name" in m]
 
+    def is_reachable(self, timeout: float = 0.5) -> bool:
+        """Return True if the Ollama HTTP server responds cleanly within timeout seconds."""
+        try:
+            resp = self._client.get(f"{self.base_url}/api/version", timeout=timeout)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
     def _build_options(
         self,
         raw_text: str | None = None,
@@ -431,6 +515,7 @@ class OllamaPolisher:
                     content = replaced
             if effective_style is not None:
                 content = apply_style_postprocessing(content, effective_style)
+            content = strip_long_dashes(content)
             return PolishResult(text=content, used_llm=True)
         except Exception as exc:
             return PolishResult(text=prepared_text, used_llm=False, error=str(exc))
@@ -485,6 +570,7 @@ class OllamaPolisher:
                 content = raw_content.strip("\r\n")
             else:
                 content = raw_content.strip()
+            content = strip_long_dashes(content)
             return PolishResult(text=content, used_llm=True)
         except Exception as exc:
             return PolishResult(text="", used_llm=False, error=str(exc))

@@ -320,6 +320,17 @@ TRANSLATIONS: dict[LanguageCode, dict[str, str]] = {
         "notice.download_llm_raw": "Download LLM in Settings — raw text",
         "notice.embedded_llm_raw": "Embedded LLM error — raw text",
         "notice.ollama_raw": "Ollama unavailable — raw text pasted",
+        "notice.ollama_starting": "Starting Ollama...",
+        "notice.ollama_ready": "Ollama ready! Press 2× CapsLock",
+        "notice.ollama_start_failed": "Could not start Ollama",
+        "ollama_prompt.title": "Ollama is not running",
+        "ollama_prompt.body": (
+            "Smart Cleanup is set to use Ollama ({model}), but the Ollama server is not responding at {url}.\n\n"
+            "Would you like to start Ollama now?"
+        ),
+        "ollama_prompt.btn_start": "Start Ollama",
+        "ollama_prompt.btn_continue": "Continue (Raw ASR)",
+        "ollama_prompt.btn_cancel": "Cancel",
         "notice.mic_switched": "Mic: {name}",
         "notice.mic_system_short": "System",
         "notice.mode_switched": "Mode: {profile}",
@@ -624,6 +635,17 @@ TRANSLATIONS: dict[LanguageCode, dict[str, str]] = {
         "notice.download_llm_raw": "Скачайте LLM в Настройках — сырой текст",
         "notice.embedded_llm_raw": "Ошибка встроенной LLM — сырой текст",
         "notice.ollama_raw": "Ollama недоступна — вставлен сырой текст",
+        "notice.ollama_starting": "Запускаю Ollama...",
+        "notice.ollama_ready": "Ollama готова! Нажмите 2× CapsLock",
+        "notice.ollama_start_failed": "Не удалось запустить Ollama",
+        "ollama_prompt.title": "Ollama не запущена",
+        "ollama_prompt.body": (
+            "Для умной очистки выбрана модель Ollama ({model}), но сервер Ollama не отвечает по адресу {url}.\n\n"
+            "Запустить Ollama сейчас?"
+        ),
+        "ollama_prompt.btn_start": "Запустить Ollama",
+        "ollama_prompt.btn_continue": "Продолжить (без очистки)",
+        "ollama_prompt.btn_cancel": "Отмена",
         "notice.mic_switched": "Микрофон: {name}",
         "notice.mic_system_short": "Системный",
         "notice.mode_switched": "Режим: {profile}",
