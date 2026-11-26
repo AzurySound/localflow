@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>Local, privacy-first, open-source Wispr Flow alternative for Windows.</strong><br>
-  Offline voice dictation & smart LLM text cleanup. 100% private, zero cloud dependencies.
+  Offline voice dictation, smart LLM text cleanup &amp; local meeting Notetaker. 100% private, zero cloud dependencies.
 </p>
 
 <p align="center">
@@ -19,7 +19,7 @@
   <img src="https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-blue?logo=windows" alt="Platform">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT License">
   <img src="https://img.shields.io/badge/Engine-faster--whisper%20%2B%20llama.cpp-violet" alt="Engine">
-  <img src="https://img.shields.io/badge/Tests-232%20passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/Tests-252%20passing-brightgreen" alt="Tests">
 </p>
 
 ---
@@ -45,12 +45,32 @@
 - **Smart Speech Cleanup**: Removes filler words (*"um"*, *"uh"*, *"you know"*, *"ну то есть"*), fixes stutters, glues awkward pause breaks, and resolves mid-sentence corrections (*"let's add a button, actually let's finish for today"* &rarr; keeps only the final thought).
 - **IT & Technical Terms**: Preserves English programming terms, CLI flags, camelCase, and snake_case in Latin script without weird transliteration.
 - **App-Aware Styles**: Automatically formats text to match what you are doing:
-  - 🤖 **AI Chats & IDEs** (Antigravity, Cursor, ChatGPT): crisp prompts with automatic numbered lists for 3+ items.
+  - 🤖 **AI Chats & IDEs** (Antigravity, Cursor, ChatGPT): crisp prompts condensed into clean plain-text lists without bold noise.
   - 💬 **Messengers** (Telegram, Slack, Discord): natural conversational tone.
   - 📄 **Docs & Email** (Word, Notion, Outlook): clean paragraphs and bullet points.
   - ⌨ **Raw Mode**: direct transcript without LLM edits.
 - **Standalone Engine**: Includes an embedded `llama.cpp` runtime with Vulkan GPU acceleration & 1-click model downloads. External **Ollama** is also supported.
 - **Bilingual & Themed**: English and Russian UI with Dark, Light, and System themes.
+
+---
+
+## Notetaker (Local Meeting Notes)
+
+Record and summarize online or in-person calls locally — no bots joining your call, and no calendar connection required.
+
+- **Dual-Stream Capture (`Mic + System Audio`)**: Records your microphone together with Windows system audio via WASAPI loopback, with echo-bleed suppression.
+- **Speaker Diarization**: Distinguishes `You` from remote participants (`Speaker 1`, `Speaker 2`, …) using ONNX speaker embeddings, post-meeting cluster refinement, and click-to-rename chips.
+- **Meeting Side Window**: Live streaming transcript bubbles, transcript search, manual *My thoughts* notes, **Pause / Resume**, and parallel voice dictation while a meeting is active.
+- **AI Summary & Q&A**: Generates structured summaries (**TL;DR**, **Key Points**, **Action Items**) in your configured UI language, plus an interactive *Ask anything about this meeting* Q&A bar.
+
+<p align="center">
+  <img src="docs/screenshots/notetaker_transcript.png" alt="LocalFlow Notetaker Live Transcript" width="380">&nbsp;&nbsp;
+  <img src="docs/screenshots/notetaker_summary.png" alt="LocalFlow Notetaker Summary & Action Items" width="380">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/notetaker_hub.png" alt="LocalFlow Notetaker Hub" width="780">
+</p>
 
 ---
 
@@ -105,7 +125,7 @@ uv run localflow
 ### Run Tests
 ```powershell
 uv run pytest -q
-# 232 passed, 41 subtests passed
+# 252 passed, 41 subtests passed
 ```
 
 ### Build Installer
