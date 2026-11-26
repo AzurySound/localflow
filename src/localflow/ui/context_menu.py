@@ -37,6 +37,7 @@ class QuickMenuState:
     is_snoozed: bool
     last_dictation_preview: str = ""
     last_raw_preview: str = ""
+    is_meeting_active: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +54,7 @@ class QuickMenuCallbacks:
     on_open_settings: Callable[[], None]
     on_quit: Callable[[], None]
     on_copy_last_raw: Callable[[], None] | None = None
+    on_toggle_meeting: Callable[[], None] | None = None
 
 
 def populate_microphone_menu(
@@ -208,6 +210,12 @@ def build_quick_menu(
     open_settings_act = QAction(tr("menu.settings", lang), menu)
     open_settings_act.triggered.connect(callbacks.on_open_settings)
     menu.addAction(open_settings_act)
+
+    if callbacks.on_toggle_meeting is not None:
+        meeting_lbl = tr("menu.stop_meeting", lang) if state.is_meeting_active else tr("menu.start_meeting", lang)
+        meeting_act = QAction(meeting_lbl, menu)
+        meeting_act.triggered.connect(callbacks.on_toggle_meeting)
+        menu.addAction(meeting_act)
 
     menu.addSeparator()
 

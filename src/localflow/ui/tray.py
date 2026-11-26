@@ -58,6 +58,7 @@ class LocalFlowTray(QSystemTrayIcon):
     reset_position_requested = Signal()
     copy_last_dictation_requested = Signal()
     copy_last_raw_requested = Signal()
+    meeting_toggle_requested = Signal()
     quit_requested = Signal()
 
     def __init__(
@@ -81,6 +82,7 @@ class LocalFlowTray(QSystemTrayIcon):
         self._lang: LanguageCode = normalize_language(lang)
         self._last_preview_raw: str = ""
         self._last_raw_asr: str = ""
+        self._meeting_active = False
 
         self.setIcon(self._icon_idle)
         self.setToolTip(tr("tray.tooltip", self._lang))
@@ -155,6 +157,10 @@ class LocalFlowTray(QSystemTrayIcon):
         self._open_action.triggered.connect(self.open_settings_requested.emit)
         menu.addAction(self._open_action)
 
+        self._meeting_action = QAction(tr("tray.start_meeting", self._lang), menu)
+        self._meeting_action.triggered.connect(self.meeting_toggle_requested.emit)
+        menu.addAction(self._meeting_action)
+
         menu.addSeparator()
 
         self._quit_action = QAction(tr("menu.quit", self._lang), menu)
@@ -182,6 +188,9 @@ class LocalFlowTray(QSystemTrayIcon):
         self._copy_last_action.setText(tr("menu.copy_to_clipboard", self._lang))
         self._copy_raw_action.setText(tr("menu.copy_raw_asr", self._lang))
         self._open_action.setText(tr("menu.settings", self._lang))
+        self._meeting_action.setText(
+            tr("tray.stop_meeting", self._lang) if self._meeting_active else tr("tray.start_meeting", self._lang)
+        )
         self._quit_action.setText(tr("menu.quit", self._lang))
         self.set_last_dictation_preview(self._last_preview_raw)
         self.set_last_raw_preview(self._last_raw_asr)
@@ -212,6 +221,12 @@ class LocalFlowTray(QSystemTrayIcon):
 
     def set_asr_status(self, text: str) -> None:
         self._status_action.setText(text)
+
+    def set_meeting_active(self, active: bool) -> None:
+        self._meeting_active = active
+        self._meeting_action.setText(
+            tr("tray.stop_meeting", self._lang) if active else tr("tray.start_meeting", self._lang)
+        )
 
     def set_llm_checked(self, enabled: bool) -> None:
         self._llm_action.blockSignals(True)

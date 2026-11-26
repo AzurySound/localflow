@@ -1,6 +1,6 @@
 [project]
 name = "localflow"
-version = "0.2.3"
+version = "0.3.0"
 description = "Standalone local Wispr Flow alternative for Windows (PySide6 + faster-whisper + embedded llama.cpp / Ollama)"
 readme = "README.md"
 license = "MIT"
@@ -40,6 +40,7 @@ dependencies = [
     "numpy>=2.0.0",
     "httpx>=0.28.0",
     "pydantic>=2.10.0",
+    "pyaudiowpatch>=0.2.12.9",
 ]
 
 [project.scripts]

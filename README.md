@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/AzurySound/localflow/releases/latest">
-    <img src="https://img.shields.io/badge/Download-LocalFlow%20Setup%20(v0.2.3)-2563eb?style=for-the-badge&logo=windows&logoColor=white" alt="Download">
+    <img src="https://img.shields.io/badge/Download-LocalFlow%20Setup%20(v0.3.0)-2563eb?style=for-the-badge&logo=windows&logoColor=white" alt="Download">
   </a>
 </p>
 
@@ -68,7 +68,7 @@
 
 ## Quick Install
 
-1. Download **[LocalFlow-Setup-0.2.3.exe](https://github.com/AzurySound/localflow/releases/latest)** *(or the zero-install `LocalFlow-0.2.3-portable.zip`)*.
+1. Download **[LocalFlow-Setup-0.3.0.exe](https://github.com/AzurySound/localflow/releases/latest)** *(or the zero-install `LocalFlow-0.3.0-portable.zip`)*.
 2. Run the installer (installs per-user, no admin rights required).
 3. On first launch, download the recommended lightweight models in 1 click:
    - **Speech Recognition**: Whisper `small` (~460 MB) or `large-v3-turbo` (~1.6 GB).

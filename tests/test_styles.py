@@ -107,20 +107,23 @@ def test_apply_style_postprocessing_trailing_period_rules() -> None:
     alive = STYLE_PROFILES["messenger_alive"]
     prompt = STYLE_PROFILES["ai_prompt"]
 
-    # Short single sentence drops single trailing period
+    # Never keep a single trailing period at the end of the final sentence
     assert apply_style_postprocessing("Привет, как дела.", alive) == "Привет, как дела"
-    # Preserves ?, !, ...
+    assert apply_style_postprocessing("Привет. Как дела.", alive) == "Привет. Как дела"
+    assert apply_style_postprocessing("Первая\nВторая.", alive) == "Первая\nВторая"
+    long_msg = "Один два три четыре пять шесть семь восемь девять десять одиннадцать двенадцать тринадцать."
+    assert apply_style_postprocessing(long_msg, alive) == long_msg[:-1]
+    assert apply_style_postprocessing("Сделай план.", prompt) == "Сделай план"
+
+    # Preserves ?, !, ..., common abbreviations, and decimal numbers
     assert apply_style_postprocessing("Как дела?", alive) == "Как дела?"
     assert apply_style_postprocessing("Круто!", alive) == "Круто!"
     assert apply_style_postprocessing("Ну такое...", alive) == "Ну такое..."
-    # Preserves multi-sentence and multiline
-    assert apply_style_postprocessing("Привет. Как дела.", alive) == "Привет. Как дела."
-    assert apply_style_postprocessing("Первая\nВторая.", alive) == "Первая\nВторая."
-    # Preserves > 12 words
-    long_msg = "Один два три четыре пять шесть семь восемь девять десять одиннадцать двенадцать тринадцать."
-    assert apply_style_postprocessing(long_msg, alive) == long_msg
-    # Non-stripping profile preserves trailing period
-    assert apply_style_postprocessing("Сделай план.", prompt) == "Сделай план."
+    assert apply_style_postprocessing("Фрукты, овощи и т.д.", alive) == "Фрукты, овощи и т.д."
+    assert apply_style_postprocessing("Версия v1.0", alive) == "Версия v1.0"
+
+    # ai_prompt deterministically strips accidental markdown bold markers
+    assert apply_style_postprocessing("План:\n- **Шаг 1**: тест.", prompt) == "План:\n- Шаг 1: тест"
 
 
 def test_parse_and_format_app_style_overrides() -> None:
@@ -159,7 +162,7 @@ def test_polisher_uses_style_profile_and_skips_http_for_raw() -> None:
     assert "вайбкожу" in user_msg
     assert captured_payloads[0]["options"]["temperature"] == pytest.approx(0.05)
 
-    # 2. ai_prompt uses temperature=0.05 and num_predict >= 256 for multi-word requests
+    # 2. ai_prompt uses standalone plain-text system prompt, temperature=0.12, and strips final period
     ai_ctx = classify_window("chrome.exe", "ChatGPT - Google Chrome")
     prompt_prof = resolve_style_profile(ai_ctx)
     res_ai = polisher.polish(
@@ -168,16 +171,16 @@ def test_polisher_uses_style_profile_and_skips_http_for_raw() -> None:
         style_profile=prompt_prof,
     )
     assert res_ai.used_llm is True
-    assert res_ai.text == "Ок, погнали."
-    assert captured_payloads[1]["options"]["temperature"] == pytest.approx(0.05)
+    assert res_ai.text == "Ок, погнали"
+    assert captured_payloads[1]["options"]["temperature"] == pytest.approx(0.12)
     assert captured_payloads[1]["options"]["num_predict"] >= 256
-    assert "impersonal infinitive" in captured_payloads[1]["messages"][0]["content"]
+    assert "NEVER use markdown bold" in captured_payloads[1]["messages"][0]["content"]
 
     # 2b. Ultra-short 1-2 word prompt ("Проанализируй.") falls back to gentle default instruction
     polisher.polish("Проанализируй.", window_context=ai_ctx, style_profile=prompt_prof)
     short_sys = captured_payloads[2]["messages"][0]["content"]
     assert "Style (general)" in short_sys
-    assert "3+ distinct" not in short_sys
+    assert "NEVER use markdown bold" not in short_sys
 
     # 3. raw profile skips HTTP completely and applies vocabulary replacements
     res_raw = polisher.polish("я сижу вайп кожу", style_profile=STYLE_PROFILES["raw"])
@@ -189,6 +192,15 @@ def test_polisher_uses_style_profile_and_skips_http_for_raw() -> None:
     built = build_polish_system_prompt("Base", window_context=tg, style_profile=alive)
     assert "Active window: Telegram" in built
     assert alive.instruction in built
+
+
+def test_validate_polish_output_allows_ai_prompt_condensation() -> None:
+    from localflow.llm.ollama_polisher import validate_polish_output
+
+    verbose_input = "x " * 120  # 240 chars
+    condensed_output = "y " * 38  # 76 chars (~31% of input)
+    assert validate_polish_output(condensed_output, verbose_input, style_key="default") is not None
+    assert validate_polish_output(condensed_output, verbose_input, style_key="ai_prompt") is None
 
 
 def test_load_config_auto_migrates_legacy_default_prompts_but_preserves_custom(

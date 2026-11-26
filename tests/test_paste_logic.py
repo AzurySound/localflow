@@ -440,6 +440,66 @@ class TestWin32TextInjectorOverwrite(unittest.TestCase):
         self.assertIn(VK_INSERT, sent_vks)
         self.assertNotIn(VK_C, sent_vks)
 
+    def test_mid_sentence_adaptation_and_context_rules(self) -> None:
+        # 1. Middle of existing sentence (followed by word) -> lowercase, no trailing period, space on right
+        self.assertTrue(win32_paste.is_mid_sentence("я хочу ", "домой"))
+        adapted = win32_paste.adapt_text_for_inline_insertion(
+            "Быстро пойти.",
+            "я хочу ",
+            "д",
+        )
+        self.assertEqual(adapted, "быстро пойти ")
+
+        # 2. End of unfinished sentence (no punctuation on left) -> lowercase, no trailing period
+        self.assertTrue(win32_paste.is_mid_sentence("нужно добавить ", ""))
+        self.assertEqual(
+            win32_paste.adapt_text_for_inline_insertion("Новую кнопку.", "нужно добавить ", ""),
+            "новую кнопку",
+        )
+
+        # 3. After sentence punctuation or newline -> keep capitalized
+        self.assertFalse(win32_paste.is_mid_sentence("Привет. ", ""))
+        self.assertFalse(win32_paste.is_mid_sentence("Строка\n", ""))
+        self.assertEqual(
+            win32_paste.adapt_text_for_inline_insertion("Новая фраза", "Привет. ", ""),
+            "Новая фраза",
+        )
+
+        # 4. Preserve acronyms, English 'I', camelCase, and capitalized custom_vocabulary terms
+        self.assertEqual(
+            win32_paste.adapt_text_for_inline_insertion("API ключ", "создать ", ""),
+            "API ключ",
+        )
+        self.assertEqual(
+            win32_paste.adapt_text_for_inline_insertion("I think", "and ", ""),
+            "I think",
+        )
+        self.assertEqual(
+            win32_paste.adapt_text_for_inline_insertion(
+                "Docker контейнер",
+                "запустить ",
+                "",
+                preserve_words=("Docker", "LocalFlow"),
+            ),
+            "Docker контейнер",
+        )
+
+        # 5. Injector end-to-end with surrounding context double
+        inj = Win32TextInjector(
+            get_clipboard_text=lambda: "prev",
+            set_clipboard_text=lambda _t: True,
+            get_clipboard_sequence_number=lambda: 1,
+            get_async_key_state=lambda _vk: 0,
+            send_keys=lambda _b: None,
+            peek_surrounding_context=lambda: ("я хочу", "домой"),
+            has_active_selection=lambda: False,
+            sleep=lambda _s: None,
+        )
+        pasted: list[str] = []
+        inj._set_clipboard_text = lambda t: (pasted.append(t) or True)  # type: ignore[assignment]
+        assert inj.inject("Быстро пойти.", auto_space=True, restore_clipboard=True, smart_inline_case=True)
+        self.assertEqual(pasted[0], " быстро пойти ")
+
 
 class TestCaptureSelectedTextWrapper(unittest.TestCase):
     def test_module_wrapper_delegates_to_win32_text_injector(self) -> None:

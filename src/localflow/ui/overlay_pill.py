@@ -50,7 +50,9 @@ class PillMode(str, Enum):
     TRANSCRIBING = "transcribing"
     POLISHING = "polishing"
     DOWNLOADING = "downloading"
+    WARMING = "warming"
     NOTICE = "notice"
+    MEETING = "meeting"
 
 
 class FloatingPillWidget(QWidget):
@@ -61,6 +63,7 @@ class FloatingPillWidget(QWidget):
     cancel_requested = Signal()
     copy_last_requested = Signal()
     download_clicked = Signal()
+    meeting_clicked = Signal()
     context_menu_requested = Signal(QPoint)
 
     def __init__(self, initial_pos: tuple[int, int] | None = None) -> None:
@@ -85,6 +88,9 @@ class FloatingPillWidget(QWidget):
         self._notice_is_error = False
         self._download_label = ""
         self._download_percent = -1
+        self._warming_text = ""
+        self._warming_queued = False
+        self._meeting_elapsed_sec = 0.0
         self._live_preview_enabled = True
         self._preview_text = ""
         self._idle_bar_enabled = False
@@ -449,7 +455,7 @@ class FloatingPillWidget(QWidget):
                 if self._mode == PillMode.IDLE_BAR:
                     anchor_x = pos.x() - (COMPACT_WIDTH - self.width()) // 2
                     anchor_y = pos.y() - (PILL_HEIGHT - self.height())
-                elif self._mode == PillMode.NOTICE or self._mode == PillMode.DOWNLOADING:
+                elif self._mode in (PillMode.NOTICE, PillMode.DOWNLOADING, PillMode.WARMING):
                     anchor_x = pos.x() - (COMPACT_WIDTH - self.width()) // 2
                     anchor_y = pos.y()
                 else:
@@ -470,6 +476,10 @@ class FloatingPillWidget(QWidget):
                         self.toggle_requested.emit()
                 elif self._mode == PillMode.DOWNLOADING:
                     self.download_clicked.emit()
+                elif self._mode == PillMode.WARMING and self._warming_queued:
+                    self.cancel_requested.emit()
+                elif self._mode == PillMode.MEETING:
+                    self.meeting_clicked.emit()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -620,6 +630,25 @@ class FloatingPillWidget(QWidget):
             self._anim_timer.stop()
         self.update()
 
+    def show_warming(self, text: str, *, queued: bool = False) -> None:
+        """Show calm animated model warm-up countdown (never alarming red)."""
+        self._hide_timer.stop()
+        self._leave_timer.stop()
+        self._mode = PillMode.WARMING
+        self._command_mode = False
+        self._preview_text = ""
+        self._cancel_hovered = False
+        self._warming_text = (text or tr("pill.warming", self._lang)).strip()
+        self._warming_queued = queued
+        self.setCursor(Qt.CursorShape.PointingHandCursor if queued else Qt.CursorShape.OpenHandCursor)
+        width = max(148, min(250, self._font_metrics.horizontalAdvance(self._warming_text) + 46))
+        if self.width() != width or not self.isVisible():
+            self._apply_width_and_position(width)
+            self.show()
+        if not self._anim_timer.isActive():
+            self._anim_timer.start()
+        self.update()
+
     def show_notice(self, text: str, *, is_error: bool = False, duration_ms: int = 2200) -> None:
         self._leave_timer.stop()
         self._mode = PillMode.NOTICE
@@ -710,72 +739,114 @@ class FloatingPillWidget(QWidget):
         if top_offset > 0:
             self._paint_preview(painter)
 
-        pill_x = 0.0 if self._mode == PillMode.NOTICE else float(self._pill_offset_x)
-        pill_w = float(self.width() if self._mode == PillMode.NOTICE else COMPACT_WIDTH)
+        pill_x = 0.0 if self._mode in (PillMode.NOTICE, PillMode.WARMING) else float(self._pill_offset_x)
+        pill_w = float(self.width() if self._mode in (PillMode.NOTICE, PillMode.WARMING) else COMPACT_WIDTH)
 
         painter.save()
-        painter.translate(pill_x, float(top_offset))
+        try:
+            painter.translate(pill_x, float(top_offset))
 
-        rect = QRectF(0.75, 0.75, pill_w - 1.5, PILL_HEIGHT - 1.5)
-        radius = rect.height() / 2.0
+            rect = QRectF(0.75, 0.75, pill_w - 1.5, PILL_HEIGHT - 1.5)
+            radius = rect.height() / 2.0
 
-        path = QPainterPath()
-        path.addRoundedRect(rect, radius, radius)
+            path = QPainterPath()
+            path.addRoundedRect(rect, radius, radius)
 
-        # Glass surface with subtle vertical tint
+            # Glass surface with subtle vertical tint
+            is_light = self._resolved_theme == "light"
+            bg_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
+            if is_light:
+                bg_grad.setColorAt(0.0, QColor(255, 255, 255, 246))
+                bg_grad.setColorAt(1.0, QColor(242, 243, 247, 248))
+            else:
+                bg_grad.setColorAt(0.0, QColor(24, 27, 36, 242))
+                bg_grad.setColorAt(1.0, QColor(12, 14, 19, 246))
+            painter.fillPath(path, bg_grad)
+
+            # Gradient 1px edge stroke
+            border_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
+            if self._mode == PillMode.POLISHING or (self._mode == PillMode.RECORDING and self._command_mode):
+                if is_light:
+                    border_grad.setColorAt(0.0, QColor(124, 58, 237, 175))
+                    border_grad.setColorAt(1.0, QColor(99, 102, 241, 90))
+                else:
+                    border_grad.setColorAt(0.0, QColor(167, 139, 250, 175))
+                    border_grad.setColorAt(1.0, QColor(99, 102, 241, 80))
+            elif self._mode in (PillMode.TRANSCRIBING, PillMode.WARMING):
+                if is_light:
+                    border_grad.setColorAt(0.0, QColor(13, 148, 136, 165))
+                    border_grad.setColorAt(1.0, QColor(99, 102, 241, 80))
+                else:
+                    border_grad.setColorAt(0.0, QColor(45, 212, 191, 165))
+                    border_grad.setColorAt(1.0, QColor(167, 139, 250, 75))
+            elif self._mode == PillMode.RECORDING:
+                if is_light:
+                    border_grad.setColorAt(0.0, QColor(24, 24, 27, 48))
+                    border_grad.setColorAt(1.0, QColor(24, 24, 27, 28))
+                else:
+                    border_grad.setColorAt(0.0, QColor(255, 255, 255, 68))
+                    border_grad.setColorAt(1.0, QColor(255, 255, 255, 18))
+            else:
+                if is_light:
+                    border_grad.setColorAt(0.0, QColor(24, 24, 27, 42))
+                    border_grad.setColorAt(1.0, QColor(24, 24, 27, 24))
+                else:
+                    border_grad.setColorAt(0.0, QColor(255, 255, 255, 48))
+                    border_grad.setColorAt(1.0, QColor(255, 255, 255, 14))
+            painter.setPen(QPen(border_grad, 1.0))
+            painter.drawPath(path)
+
+            if self._mode == PillMode.RECORDING:
+                self._paint_recording(painter)
+            elif self._mode in (PillMode.TRANSCRIBING, PillMode.POLISHING):
+                self._paint_processing(painter)
+            elif self._mode == PillMode.DOWNLOADING:
+                self._paint_downloading(painter)
+            elif self._mode == PillMode.WARMING:
+                self._paint_warming(painter)
+            elif self._mode == PillMode.NOTICE:
+                self._paint_notice(painter)
+            elif self._mode == PillMode.MEETING:
+                self._paint_meeting(painter)
+        finally:
+            painter.restore()
+
+    def show_meeting(self, elapsed_sec: float = 0.0) -> None:
+        """Show compact active meeting indicator inside the Flow Bar."""
+        self._hide_timer.stop()
+        self._leave_timer.stop()
+        self._mode = PillMode.MEETING
+        self._command_mode = False
+        self._preview_text = ""
+        self._meeting_elapsed_sec = max(0.0, float(elapsed_sec))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        if self.width() != COMPACT_WIDTH or not self.isVisible():
+            self._apply_width_and_position(COMPACT_WIDTH)
+            self.show()
+        if not self._anim_timer.isActive():
+            self._anim_timer.start()
+        self.update()
+
+    def _paint_meeting(self, painter: QPainter) -> None:
         is_light = self._resolved_theme == "light"
-        bg_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
-        if is_light:
-            bg_grad.setColorAt(0.0, QColor(255, 255, 255, 246))
-            bg_grad.setColorAt(1.0, QColor(242, 243, 247, 248))
-        else:
-            bg_grad.setColorAt(0.0, QColor(24, 27, 36, 242))
-            bg_grad.setColorAt(1.0, QColor(12, 14, 19, 246))
-        painter.fillPath(path, bg_grad)
+        total = max(0, int(self._meeting_elapsed_sec))
+        mins, secs = divmod(total, 60)
+        hrs, mins = divmod(mins, 60)
+        ts = f"{hrs:02d}:{mins:02d}:{secs:02d}" if hrs > 0 else f"{mins:02d}:{secs:02d}"
 
-        # Gradient 1px edge stroke
-        border_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
-        if self._mode == PillMode.POLISHING or (self._mode == PillMode.RECORDING and self._command_mode):
-            if is_light:
-                border_grad.setColorAt(0.0, QColor(124, 58, 237, 175))
-                border_grad.setColorAt(1.0, QColor(99, 102, 241, 90))
-            else:
-                border_grad.setColorAt(0.0, QColor(167, 139, 250, 175))
-                border_grad.setColorAt(1.0, QColor(99, 102, 241, 80))
-        elif self._mode == PillMode.TRANSCRIBING:
-            if is_light:
-                border_grad.setColorAt(0.0, QColor(2, 132, 199, 160))
-                border_grad.setColorAt(1.0, QColor(14, 165, 233, 75))
-            else:
-                border_grad.setColorAt(0.0, QColor(56, 189, 248, 160))
-                border_grad.setColorAt(1.0, QColor(56, 189, 248, 55))
-        elif self._mode == PillMode.RECORDING:
-            if is_light:
-                border_grad.setColorAt(0.0, QColor(24, 24, 27, 48))
-                border_grad.setColorAt(1.0, QColor(24, 24, 27, 28))
-            else:
-                border_grad.setColorAt(0.0, QColor(255, 255, 255, 68))
-                border_grad.setColorAt(1.0, QColor(255, 255, 255, 18))
-        else:
-            if is_light:
-                border_grad.setColorAt(0.0, QColor(24, 24, 27, 42))
-                border_grad.setColorAt(1.0, QColor(24, 24, 27, 24))
-            else:
-                border_grad.setColorAt(0.0, QColor(255, 255, 255, 48))
-                border_grad.setColorAt(1.0, QColor(255, 255, 255, 14))
-        painter.setPen(QPen(border_grad, 1.0))
-        painter.drawPath(path)
+        pulse = 0.65 + 0.35 * math.sin(self._phase * 2.0)
+        dot_color = QColor(239, 68, 68, int(round(255 * pulse)))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(dot_color)
+        painter.drawEllipse(QRectF(14.0, (PILL_HEIGHT - 8.0) / 2.0, 8.0, 8.0))
 
-        if self._mode == PillMode.RECORDING:
-            self._paint_recording(painter)
-        elif self._mode in (PillMode.TRANSCRIBING, PillMode.POLISHING):
-            self._paint_processing(painter)
-        elif self._mode == PillMode.DOWNLOADING:
-            self._paint_downloading(painter)
-        elif self._mode == PillMode.NOTICE:
-            self._paint_notice(painter)
-
-        painter.restore()
+        painter.setPen(QColor(24, 24, 27) if is_light else QColor(248, 250, 252))
+        painter.setFont(self._font_label)
+        painter.drawText(
+            QRectF(28.0, 0.0, COMPACT_WIDTH - 36.0, float(PILL_HEIGHT)),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            f"Rec {ts}",
+        )
 
     def _paint_idle_bar(self, painter: QPainter) -> None:
         is_light = self._resolved_theme == "light"
@@ -1069,6 +1140,52 @@ class FloatingPillWidget(QWidget):
             QRectF(12.0, 0.0, w - 24.0, h - 2.0),
             Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextSingleLine,
             display,
+        )
+
+    def _paint_warming(self, painter: QPainter) -> None:
+        is_light = self._resolved_theme == "light"
+        w = float(self.width())
+        h = float(PILL_HEIGHT)
+
+        # Soft animated shimmer bar along bottom edge inside rounded clip
+        clip_path = QPainterPath()
+        clip_path.addRoundedRect(QRectF(1.0, 1.0, w - 2.0, h - 2.0), (h - 2.0) / 2.0, (h - 2.0) / 2.0)
+        painter.save()
+        try:
+            painter.setClipPath(clip_path)
+            bar_h = 2.5
+            bar_y = h - bar_h - 1.0
+            track_color = QColor(24, 24, 27, 20) if is_light else QColor(255, 255, 255, 18)
+            painter.fillRect(QRectF(0.0, bar_y, w, bar_h), track_color)
+            fill_grad = QLinearGradient(0.0, 0.0, w, 0.0)
+            if is_light:
+                fill_grad.setColorAt(0.0, QColor(13, 148, 136))
+                fill_grad.setColorAt(1.0, QColor(99, 102, 241))
+            else:
+                fill_grad.setColorAt(0.0, QColor(45, 212, 191))
+                fill_grad.setColorAt(1.0, QColor(167, 139, 250))
+            seg_w = w * 0.36
+            pos = ((math.sin(self._phase * 0.65) + 1.0) / 2.0) * (w - seg_w)
+            painter.fillRect(QRectF(pos, bar_y, seg_w, bar_h), fill_grad)
+        finally:
+            painter.restore()
+
+        dot_color = QColor(13, 148, 136) if is_light else QColor(45, 212, 191)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for i in range(3):
+            alpha = int(90 + 165 * (0.5 + 0.5 * math.sin(self._phase * 1.1 - i * 0.85)))
+            c = QColor(dot_color)
+            c.setAlpha(alpha)
+            painter.setBrush(c)
+            painter.drawEllipse(QRectF(13.0 + i * 7.0, 13.5, 4.5, 4.5))
+
+        text_color = QColor(24, 24, 27) if is_light else QColor(243, 244, 246)
+        painter.setPen(text_color)
+        painter.setFont(self._font_label)
+        painter.drawText(
+            QRectF(36.0, 0.0, w - 46.0, h - 2.0),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextSingleLine,
+            self._warming_text,
         )
 
     def _paint_notice(self, painter: QPainter) -> None:

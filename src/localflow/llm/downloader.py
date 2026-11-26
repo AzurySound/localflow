@@ -14,8 +14,12 @@ import httpx
 from localflow.i18n import tr
 from localflow import __version__
 from localflow.llm.model_catalog import (
+    DIARIZATION_MODEL_FILENAME,
+    DIARIZATION_MODEL_URL,
     EmbeddedModelSpec,
+    find_diarization_model_path,
     find_llama_server_binary,
+    get_diarization_models_dir,
     get_llama_runtime_dir,
     get_llm_models_dir,
 )
@@ -486,3 +490,27 @@ def download_whisper_model(
     finally:
         if owns_client:
             http.close()
+
+
+def download_diarization_model(
+    *,
+    base_dir: Path | None = None,
+    on_progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+    client: httpx.Client | None = None,
+    lang: str | None = None,
+) -> Path:
+    """Download the lightweight ONNX speaker-embedding model (~26 MB) into models/diarization."""
+    existing = find_diarization_model_path(base_dir)
+    if existing is not None:
+        return existing
+
+    dest_path = get_diarization_models_dir(base_dir) / DIARIZATION_MODEL_FILENAME
+    return download_file(
+        DIARIZATION_MODEL_URL,
+        dest_path,
+        stage=tr("download.stage.diarization", lang),
+        on_progress=on_progress,
+        cancel_event=cancel_event,
+        client=client,
+    )

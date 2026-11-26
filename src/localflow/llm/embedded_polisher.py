@@ -24,7 +24,12 @@ from localflow.llm.ollama_polisher import (
     strip_transcript_wrapper,
     validate_polish_output,
 )
-from localflow.styles import DEFAULT_STYLE_INSTRUCTIONS, StyleProfile, apply_style_postprocessing
+from localflow.styles import (
+    DEFAULT_STYLE_INSTRUCTIONS,
+    StyleProfile,
+    apply_style_postprocessing,
+    strip_final_period,
+)
 from localflow.vocabulary import ParsedVocabulary, apply_vocabulary_replacements
 
 
@@ -249,7 +254,12 @@ class EmbeddedLlamaPolisher:
             content = strip_transcript_wrapper(raw_content)
             if not content:
                 return PolishResult(text=prepared_text, used_llm=False, error="Empty LLM response")
-            leak_err = validate_polish_output(content, prepared_text, finish_reason=finish_reason)
+            leak_err = validate_polish_output(
+                content,
+                prepared_text,
+                finish_reason=finish_reason,
+                style_key=effective_style.key if effective_style is not None else None,
+            )
             if leak_err is not None:
                 return PolishResult(text=prepared_text, used_llm=False, error=leak_err)
             if self.vocabulary.replacements:
@@ -260,6 +270,8 @@ class EmbeddedLlamaPolisher:
                     content = replaced
             if effective_style is not None:
                 content = apply_style_postprocessing(content, effective_style)
+            else:
+                content = strip_final_period(content)
             content = strip_long_dashes(content)
             return PolishResult(text=content, used_llm=True)
         except Exception as exc:
@@ -307,3 +319,20 @@ class EmbeddedLlamaPolisher:
             return PolishResult(text=content, used_llm=True)
         except Exception as exc:
             return PolishResult(text="", used_llm=False, error=str(exc))
+
+    def generate_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 1200,
+    ) -> str:
+        """Run a general-purpose chat completion (for Notetaker summary & Q&A)."""
+        content = self._chat_completion(
+            system_content=system_prompt,
+            user_content=user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return strip_long_dashes(content.strip())

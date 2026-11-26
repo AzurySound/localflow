@@ -75,6 +75,8 @@ from localflow.llm.model_catalog import (
 from localflow.llm.embedded_polisher import EmbeddedLlamaPolisher
 from localflow.llm.ollama_polisher import OllamaPolisher
 from localflow.storage import HistoryStorage
+from localflow.notetaker.storage import MeetingStorage
+from localflow.ui.notetaker_page import NotetakerPage
 from localflow.styles import (
     DEFAULT_CATEGORY_STYLES,
     STYLE_PROFILES,
@@ -243,10 +245,16 @@ class SettingsWindow(QWidget):
     _rerun_finished = Signal(int, object)  # entry_id, PolishResult
     _rerun_failed = Signal(int, str)  # entry_id, error
 
-    def __init__(self, config: AppConfig, storage: HistoryStorage) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        storage: HistoryStorage,
+        meeting_storage: MeetingStorage | None = None,
+    ) -> None:
         super().__init__()
         self._config = config
         self._storage = storage
+        self._meeting_storage = meeting_storage or MeetingStorage()
         self._lang: LanguageCode = normalize_language(config.language)
         self._resolved_theme: ResolvedTheme = resolve_theme(config.theme)
         self._i18n_texts: list[tuple[QWidget, str]] = []
@@ -290,11 +298,17 @@ class SettingsWindow(QWidget):
 
         self._tabs = QStackedWidget()
         self._history_tab = self._build_history_tab()
+        self._notetaker_tab = NotetakerPage(
+            self._meeting_storage,
+            lang=self._lang,
+            theme=self._resolved_theme,
+        )
         self._insights_tab = InsightsPage()
         self._vocab_tab = self._build_vocab_tab()
         self._style_tab = self._build_style_tab()
         self._settings_tab = self._build_settings_tab()
         self._tabs.addWidget(self._history_tab)
+        self._tabs.addWidget(self._notetaker_tab)
         self._tabs.addWidget(self._insights_tab)
         self._tabs.addWidget(self._vocab_tab)
         self._tabs.addWidget(self._style_tab)
@@ -346,6 +360,7 @@ class SettingsWindow(QWidget):
         self._resolved_theme = resolved
         self.setStyleSheet(build_hub_stylesheet(resolved))
         self._logo_glyph.set_theme(resolved)
+        self._notetaker_tab.set_theme(resolved)
         self._insights_tab.set_theme(resolved)
         self._update_status_card(self._config)
         for combo in self.findChildren(_DropdownCombo):
@@ -404,6 +419,7 @@ class SettingsWindow(QWidget):
         if self._editing_style_key not in self._pending_style_instructions:
             self._load_style_instruction_editor(self._editing_style_key)
 
+        self._notetaker_tab.retranslate(new_lang)
         self._insights_tab.set_language(new_lang)
         self._update_status_card(self._config)
         self._update_history_stats_label()
@@ -443,17 +459,20 @@ class SettingsWindow(QWidget):
         self._nav_group.setExclusive(True)
 
         self._nav_history = self._make_nav_button(tr("nav.history", self._lang), checked=True)
+        self._nav_notetaker = self._make_nav_button(tr("nav.notetaker", self._lang))
         self._nav_insights = self._make_nav_button(tr("nav.insights", self._lang))
         self._nav_vocab = self._make_nav_button(tr("nav.vocab", self._lang))
         self._nav_style = self._make_nav_button(tr("nav.style", self._lang))
         self._nav_settings = self._make_nav_button(tr("nav.settings", self._lang))
         self._bind_text(self._nav_history, "nav.history")
+        self._bind_text(self._nav_notetaker, "nav.notetaker")
         self._bind_text(self._nav_insights, "nav.insights")
         self._bind_text(self._nav_vocab, "nav.vocab")
         self._bind_text(self._nav_style, "nav.style")
         self._bind_text(self._nav_settings, "nav.settings")
 
         self._nav_history.clicked.connect(lambda: self._navigate_to("history"))
+        self._nav_notetaker.clicked.connect(lambda: self._navigate_to("notetaker"))
         self._nav_insights.clicked.connect(lambda: self._navigate_to("insights"))
         self._nav_vocab.clicked.connect(lambda: self._navigate_to("vocab"))
         self._nav_style.clicked.connect(lambda: self._navigate_to("style"))
@@ -461,6 +480,7 @@ class SettingsWindow(QWidget):
 
         for btn in (
             self._nav_history,
+            self._nav_notetaker,
             self._nav_insights,
             self._nav_vocab,
             self._nav_style,
@@ -538,6 +558,9 @@ class SettingsWindow(QWidget):
     def _navigate_to(self, target: str) -> None:
         if target == "history":
             self._tabs.setCurrentWidget(self._history_tab)
+        elif target == "notetaker":
+            self._notetaker_tab.refresh_meetings()
+            self._tabs.setCurrentWidget(self._notetaker_tab)
         elif target == "insights":
             self.refresh_insights()
             self._tabs.setCurrentWidget(self._insights_tab)
@@ -548,10 +571,22 @@ class SettingsWindow(QWidget):
         else:
             self._tabs.setCurrentWidget(self._settings_tab)
 
+    @property
+    def notetaker_tab(self) -> NotetakerPage:
+        return self._notetaker_tab
+
+    def show_notetaker(self) -> None:
+        self._navigate_to("notetaker")
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def _sync_sidebar_for_stack_index(self, index: int) -> None:
         w = self._tabs.widget(index)
         if w is self._history_tab:
             self._nav_history.setChecked(True)
+        elif w is self._notetaker_tab:
+            self._nav_notetaker.setChecked(True)
         elif w is self._insights_tab:
             self._nav_insights.setChecked(True)
         elif w is self._vocab_tab:

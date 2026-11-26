@@ -83,6 +83,25 @@ EMBEDDED_LLM_MODELS: tuple[EmbeddedModelSpec, ...] = (
 DEFAULT_EMBEDDED_MODEL_ID = "qwen25-1.5b"
 RECOMMENDED_EMBEDDED_MODEL_ID = "gemma3-4b"
 
+DIARIZATION_MODEL_FILENAME = "wespeaker_en_voxceleb_resnet34_LM.onnx"
+DIARIZATION_MODEL_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+    "speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx"
+)
+DIARIZATION_MODEL_SIZE_MB = 26
+
+
+def get_diarization_models_dir(base_dir: Path | None = None) -> Path:
+    root = base_dir if base_dir is not None else get_app_data_dir()
+    return root / "models" / "diarization"
+
+
+def find_diarization_model_path(base_dir: Path | None = None) -> Path | None:
+    candidate = get_diarization_models_dir(base_dir) / DIARIZATION_MODEL_FILENAME
+    if candidate.is_file() and candidate.stat().st_size > 1_000_000:
+        return candidate
+    return None
+
 
 def get_model_badge(spec: EmbeddedModelSpec, lang: str | None = None) -> str:
     key = f"catalog.{spec.id}.badge"

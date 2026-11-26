@@ -21,7 +21,14 @@ from localflow.injector.window_context import (
     classify_window,
     format_window_context_line,
 )
-from localflow.styles import DEFAULT_STYLE_INSTRUCTIONS, StyleProfile, apply_style_postprocessing
+from localflow.styles import (
+    DEFAULT_STYLE_INSTRUCTIONS,
+    StyleProfile,
+    apply_style_postprocessing,
+    get_standalone_ai_prompt_system,
+    is_builtin_style_instruction,
+    strip_final_period,
+)
 from localflow.vocabulary import (
     ParsedVocabulary,
     apply_vocabulary_replacements,
@@ -202,6 +209,7 @@ def validate_polish_output(
     prepared_text: str,
     *,
     finish_reason: str | None = None,
+    style_key: str | None = None,
 ) -> str | None:
     """Return an error reason if LLM polish output leaked system prompt, truncated, or hallucinated."""
     if finish_reason == "length":
@@ -212,9 +220,12 @@ def validate_polish_output(
         if marker in low:
             return f"LLM output leaked system prompt ({marker})"
 
-    # Guard against severe mid-sentence truncation on multi-clause / long inputs
+    # Guard against severe mid-sentence truncation on multi-clause / long inputs.
+    # For ai_prompt we explicitly ask the LLM to condense verbose speech (~35-50% shorter),
+    # so allow compression down to 0.25 of source length.
     src_len = len(prepared_text.strip())
-    if src_len >= 80 and len(content.strip()) < src_len * 0.45:
+    min_ratio = 0.25 if style_key == "ai_prompt" else 0.45
+    if src_len >= 80 and len(content.strip()) < src_len * min_ratio:
         return "LLM output unexpectedly truncated input text"
 
     # Guard against small-model continuation hallucinations (e.g. 4-word input -> 400-char essay)
@@ -276,6 +287,19 @@ def build_polish_system_prompt(
         ctx_line, category = _resolve_window_context(window_context)
     vocab = _normalize_vocabulary(vocabulary)
     vocab_block = format_vocabulary_for_llm(vocab, lang=lang).strip()
+
+    use_standalone_ai_prompt = (
+        style_profile is not None
+        and style_profile.key == "ai_prompt"
+        and is_builtin_style_instruction("ai_prompt", style_profile.instruction)
+    )
+    if use_standalone_ai_prompt:
+        parts = [get_standalone_ai_prompt_system(lang).strip()]
+        if ctx_line:
+            parts.append(ctx_line)
+        if vocab_block:
+            parts.append(vocab_block)
+        return "\n\n".join(parts)
 
     if not ctx_line and category is None and not vocab_block and not style_instruction:
         return base_prompt
@@ -504,7 +528,12 @@ class OllamaPolisher:
             content = strip_transcript_wrapper(raw_content) if isinstance(raw_content, str) else ""
             if not content:
                 return PolishResult(text=prepared_text, used_llm=False, error="Empty LLM response")
-            leak_err = validate_polish_output(content, prepared_text, finish_reason=finish_reason)
+            leak_err = validate_polish_output(
+                content,
+                prepared_text,
+                finish_reason=finish_reason,
+                style_key=effective_style.key if effective_style is not None else None,
+            )
             if leak_err is not None:
                 return PolishResult(text=prepared_text, used_llm=False, error=leak_err)
             if self.vocabulary.replacements:
@@ -515,6 +544,8 @@ class OllamaPolisher:
                     content = replaced
             if effective_style is not None:
                 content = apply_style_postprocessing(content, effective_style)
+            else:
+                content = strip_final_period(content)
             content = strip_long_dashes(content)
             return PolishResult(text=content, used_llm=True)
         except Exception as exc:
@@ -574,3 +605,32 @@ class OllamaPolisher:
             return PolishResult(text=content, used_llm=True)
         except Exception as exc:
             return PolishResult(text="", used_llm=False, error=str(exc))
+
+    def generate_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 1200,
+    ) -> str:
+        """Run a general-purpose chat completion (for Notetaker summary & Q&A)."""
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "think": False,
+            "keep_alive": self.keep_alive,
+            "options": self._build_options(num_predict=max_tokens, temperature=temperature),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        resp = self._client.post(f"{self.base_url}/api/chat", json=payload, timeout=max(self.timeout_sec, 60.0))
+        resp.raise_for_status()
+        data = resp.json()
+        msg = data.get("message") if isinstance(data, dict) else None
+        raw_content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(raw_content, str):
+            return ""
+        return strip_long_dashes(raw_content.strip())

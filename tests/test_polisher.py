@@ -27,7 +27,7 @@ class TestOllamaPolisher(unittest.TestCase):
         res = polisher.polish("ну типа привет давай сделаем рефакторинг API")
         self.assertTrue(res.used_llm)
         self.assertIsNone(res.error)
-        self.assertEqual(res.text, "Привет, давай сделаем рефакторинг API.")
+        self.assertEqual(res.text, "Привет, давай сделаем рефакторинг API")
         self.assertFalse(captured_json["stream"])
         self.assertFalse(captured_json["think"])
         self.assertEqual(captured_json["model"], "qwen2.5:7b-instruct")
@@ -116,7 +116,7 @@ class TestOllamaPolisher(unittest.TestCase):
         res = polisher.polish("поставь курс в файл app.py", window_context=ctx)
 
         self.assertTrue(res.used_llm)
-        self.assertEqual(res.text, "Поставь курсор в файл app.py.")
+        self.assertEqual(res.text, "Поставь курсор в файл app.py")
         sys_msg = captured_json["messages"][0]["content"]
         self.assertIn("Active window: VS Code", sys_msg)
         self.assertIn("camelCase", sys_msg)
@@ -335,7 +335,7 @@ class TestOllamaPolisher(unittest.TestCase):
             style_profile=STYLE_PROFILES["ai_prompt"],
         )
         self.assertTrue(res.used_llm)
-        self.assertEqual(res.text, "Либо fix делается.")
+        self.assertEqual(res.text, "Либо fix делается")
         user_msg = captured["messages"][1]["content"]
         self.assertEqual(user_msg, "<transcript>\nну либо fix делается\n</transcript>")
         sys_msg = captured["messages"][0]["content"]

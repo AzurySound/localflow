@@ -89,6 +89,32 @@ class SpeechSegmenter:
     def total_samples(self) -> int:
         return self._total_samples
 
+    @property
+    def in_speech(self) -> bool:
+        return self._in_speech
+
+    def peek_active_audio(self, max_seconds: float = 12.0, min_speech_ms: int = 400) -> np.ndarray | None:
+        """Return a non-destructive copy of the currently active in-progress speech buffer."""
+        min_samples = int(round(self.sample_rate * min_speech_ms / 1000.0))
+        if not self._in_speech or self._segment_speech_samples < min_samples or not self._chunks:
+            return None
+        max_samples = max(min_samples, int(round(self.sample_rate * max_seconds)))
+        parts: list[np.ndarray] = []
+        collected = 0
+        for chunk in reversed(self._chunks):
+            parts.append(chunk)
+            collected += len(chunk)
+            if collected >= max_samples:
+                break
+        parts.reverse()
+        if len(parts) == 1:
+            arr = parts[0]
+        else:
+            arr = np.concatenate(parts, axis=0).astype(np.float32, copy=False)
+        if len(arr) > max_samples:
+            arr = arr[-max_samples:]
+        return arr.copy()
+
     def _pop_samples_until(self, target_sample: int) -> np.ndarray:
         need = target_sample - self._committed_sample
         if need <= 0 or not self._chunks:

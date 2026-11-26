@@ -94,6 +94,7 @@ hiddenimports = [
     "ctranslate2",
     "onnxruntime",
     "sounddevice",
+    "pyaudiowpatch",
     "tokenizers",
 ]
 

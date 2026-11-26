@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
+from localflow.asr.hallucinations import clean_whisper_hallucinations
 from localflow.audio.recorder import trim_edge_silence
 
 logger = logging.getLogger("localflow.asr")
@@ -78,6 +79,15 @@ class ASRStatus:
     compute_type: str
     model_name: str
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptSegment:
+    """Single timestamped segment returned by WhisperEngine.transcribe_segments()."""
+
+    start: float
+    end: float
+    text: str
 
 
 class WhisperEngine:
@@ -186,6 +196,49 @@ class WhisperEngine:
         with self._lock:
             self.initial_prompt = initial_prompt
 
+    def _run_model_transcribe(self, audio: np.ndarray, effective_prompt: str):
+        """Invoke faster-whisper with anti-hallucination decoding guards."""
+        assert self._model is not None
+        vad_params = {
+            "min_silence_duration_ms": 350,
+            "speech_pad_ms": 180,
+            "threshold": 0.5,
+        }
+        try:
+            return self._model.transcribe(
+                audio,
+                beam_size=self.beam_size,
+                vad_filter=True,
+                vad_parameters=vad_params,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+                log_prob_threshold=-1.0,
+                compression_ratio_threshold=2.4,
+                hallucination_silence_threshold=1.5,
+                initial_prompt=effective_prompt or None,
+            )
+        except TypeError:
+            return self._model.transcribe(
+                audio,
+                beam_size=self.beam_size,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 350},
+                condition_on_previous_text=False,
+                initial_prompt=effective_prompt or None,
+            )
+
+    @staticmethod
+    def _filter_segment_text(seg) -> str:
+        """Drop low-confidence non-speech segments and clean known Whisper hallucinations."""
+        no_speech = float(getattr(seg, "no_speech_prob", 0.0) or 0.0)
+        avg_logprob = float(getattr(seg, "avg_logprob", 0.0) or 0.0)
+        if no_speech > 0.65 and avg_logprob < -0.9:
+            return ""
+        raw_txt = seg.text.strip() if getattr(seg, "text", None) else ""
+        if not raw_txt:
+            return ""
+        return clean_whisper_hallucinations(raw_txt)
+
     def transcribe(self, audio: np.ndarray, *, initial_prompt: str | None = None) -> str:
         """Transcribe a 16 kHz mono float32 numpy array."""
         trimmed = trim_edge_silence(audio)
@@ -196,13 +249,43 @@ class WhisperEngine:
             if self._model is None:
                 raise RuntimeError("ASR model is not loaded yet.")
             effective_prompt = self.initial_prompt if initial_prompt is None else initial_prompt
-            segments, _info = self._model.transcribe(
-                trimmed,
-                beam_size=self.beam_size,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 350},
-                condition_on_previous_text=False,
-                initial_prompt=effective_prompt or None,
-            )
-            parts = [seg.text.strip() for seg in segments if seg.text and seg.text.strip()]
-            return " ".join(parts).strip()
+            segments, _info = self._run_model_transcribe(trimmed, effective_prompt)
+            parts = [txt for seg in segments if (txt := self._filter_segment_text(seg))]
+            return clean_whisper_hallucinations(" ".join(parts).strip())
+
+    def transcribe_segments(
+        self,
+        audio: np.ndarray,
+        *,
+        initial_prompt: str | None = None,
+        sample_rate: int = 16000,
+    ) -> list[TranscriptSegment]:
+        """Transcribe a 16 kHz mono float32 array and return timestamped segments."""
+        if audio.size == 0:
+            return []
+
+        above = np.flatnonzero(np.abs(audio) >= 0.003)
+        if above.size == 0:
+            return []
+        pad_samples = int(sample_rate * 120 / 1000)
+        trim_start = max(0, int(above[0]) - pad_samples)
+        trim_end = min(len(audio), int(above[-1]) + 1 + pad_samples)
+        trimmed = audio[trim_start:trim_end]
+        if trimmed.size == 0:
+            return []
+        offset_sec = float(trim_start) / float(max(1, sample_rate))
+
+        with self._lock:
+            if self._model is None:
+                raise RuntimeError("ASR model is not loaded yet.")
+            effective_prompt = self.initial_prompt if initial_prompt is None else initial_prompt
+            segments, _info = self._run_model_transcribe(trimmed, effective_prompt)
+            result: list[TranscriptSegment] = []
+            for seg in segments:
+                txt = self._filter_segment_text(seg)
+                if not txt:
+                    continue
+                seg_start = max(0.0, float(getattr(seg, "start", 0.0)) + offset_sec)
+                seg_end = max(seg_start, float(getattr(seg, "end", seg_start)) + offset_sec)
+                result.append(TranscriptSegment(start=seg_start, end=seg_end, text=txt))
+            return result

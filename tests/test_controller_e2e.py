@@ -522,7 +522,7 @@ def test_r3_command_ignored_while_busy_and_esc_clears_pending_command_state(
     qtbot.waitUntil(lambda: ctrl._state == AppState.IDLE, timeout=3000)
     assert len(h.ollama_requests) == 1
     assert "selected text" not in h.ollama_requests[0]["messages"][1]["content"]
-    assert ctrl._injector.inject_calls[0]["text"] == "Обычная диктовка."
+    assert ctrl._injector.inject_calls[0]["text"] == "Обычная диктовка"
 
 
 def test_r4_chunked_asr_processes_segments_before_stop_and_handles_empty_tail(
@@ -748,3 +748,42 @@ def test_cuda_two_pass_asr_uses_full_audio_instead_of_stitched_chunks(
     qtbot.waitUntil(lambda: ctrl._state == AppState.IDLE, timeout=3000)
     assert session._cancelled is True
     assert ctrl._injector.inject_calls[-1]["text"] == "цельный контекстный проход"
+
+
+def test_warming_pill_queues_autostart_and_cancels_on_esc(make_harness, qtbot) -> None:
+    ctrl, _ = make_harness(AppConfig(llm_enabled=False, ollama_warmup_on_start=False))
+
+    # Simulate ASR still loading when the user presses 2x CapsLock
+    ctrl._asr.status = ASRStatus(
+        ready=False,
+        model_name="large-v3-turbo",
+        device="cuda",
+        compute_type="int8_float16",
+    )
+    ctrl._hotkey.toggle_requested.emit()
+    assert ctrl._state == AppState.IDLE
+    assert ctrl._start_recording_when_ready is True
+    assert ctrl._pill._mode == PillMode.WARMING
+
+    # Esc cancels the queued auto-start cleanly
+    ctrl._hotkey.cancel_requested.emit()
+    assert ctrl._start_recording_when_ready is False
+    assert ctrl._state == AppState.IDLE
+    assert ctrl._pill._mode != PillMode.WARMING
+
+    # Queue again, then finish ASR loading -> recording starts automatically
+    ctrl._hotkey.toggle_requested.emit()
+    assert ctrl._start_recording_when_ready is True
+    assert ctrl._pill._mode == PillMode.WARMING
+
+    ready_status = ASRStatus(
+        ready=True,
+        model_name="large-v3-turbo",
+        device="cuda",
+        compute_type="int8_float16",
+    )
+    ctrl._asr.status = ready_status
+    ctrl._asr_loaded.emit(ctrl._asr_load_gen, ready_status)
+    qtbot.waitUntil(lambda: ctrl._state == AppState.RECORDING, timeout=3000)
+    assert ctrl._start_recording_when_ready is False
+

@@ -303,6 +303,7 @@ class AppConfig(BaseModel):
     whisper_compute_type: Literal["auto", "float16", "int8_float16", "int8"] = "int8_float16"
     whisper_beam_size: int = Field(default=2, ge=1, le=10)
     whisper_initial_prompt: str = DEFAULT_WHISPER_PROMPT
+    last_asr_load_sec: float = Field(default=5.0, ge=1.0, le=60.0)
 
     # LLM Post-processing (Embedded llama.cpp or External Ollama)
     llm_enabled: bool = True
@@ -322,6 +323,7 @@ class AppConfig(BaseModel):
     language: LanguageCode = DEFAULT_LANGUAGE
     theme: Literal["system", "dark", "light"] = "system"
     auto_space_before_paste: bool = True
+    smart_inline_case_enabled: bool = True
     paste_restore_clipboard: bool = True
     paste_delay_ms: int = Field(default=120, ge=30, le=1000)
     play_sounds: bool = True
@@ -353,6 +355,11 @@ class AppConfig(BaseModel):
     history_auto_delete_enabled: bool = False
     history_auto_delete_value: int = Field(default=7, ge=1, le=36500)
     history_auto_delete_unit: Literal["minutes", "hours", "days"] = "days"
+
+    # Notetaker
+    notetaker_audio_mode: Literal["dual", "mic_only"] = "dual"
+    notetaker_diarization_enabled: bool = True
+    notetaker_loopback_device_index: int | None = None
 
 
 def apply_performance_profile(

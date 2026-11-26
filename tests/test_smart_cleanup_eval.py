@@ -252,7 +252,7 @@ def test_polishers_strip_long_dashes_in_polish_and_transform() -> None:
     res_p = ol.polish("ну сделай кнопку синей и проверь один два теста в форме сейчас")
     assert res_p.used_llm is True
     assert "—" not in res_p.text and "–" not in res_p.text
-    assert res_p.text == "Сделай кнопку синей - и проверь 1-2 теста."
+    assert res_p.text == "Сделай кнопку синей - и проверь 1-2 теста"
 
     res_t = ol.transform_selection("текст", "сократи")
     assert res_t.used_llm is True
@@ -275,7 +275,7 @@ def test_polishers_strip_long_dashes_in_polish_and_transform() -> None:
     )
     emb_res = emb.polish("в общем итог готово два три пункта для релиза сейчас")
     assert emb_res.used_llm is True
-    assert emb_res.text == "Итог, готово 2-3 пункта."
+    assert emb_res.text == "Итог, готово 2-3 пункта"
 
 
 def test_ollama_is_reachable() -> None:

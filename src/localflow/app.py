@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 from enum import Enum
+import threading
 import time
 
 import numpy as np
@@ -12,6 +14,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from localflow.asr.chunked_session import ChunkedASRSession
 from localflow.asr.whisper_engine import ASRStatus, WhisperEngine
+from localflow.audio.loopback_recorder import AudioMode, MeetingAudioRecorder
 from localflow.audio.recorder import AudioRecorder, list_input_devices
 from localflow.audio.sound_fx import play_cue
 from localflow.autostart import set_autostart_enabled
@@ -43,8 +46,12 @@ from localflow.llm.ollama_polisher import (
     strip_long_dashes,
 )
 from localflow.storage import HistoryStorage
-from localflow.styles import apply_style_postprocessing, resolve_style_profile
+from localflow.notetaker.session import MeetingSession
+from localflow.notetaker.storage import MeetingStorage
+from localflow.notetaker.summarizer import MeetingSummarizer
+from localflow.styles import apply_style_postprocessing, resolve_style_profile, strip_final_period
 from localflow.ui.context_menu import QuickMenuCallbacks, QuickMenuState, build_quick_menu
+from localflow.ui.meeting_window import MeetingSideWindow
 from localflow.ui.overlay_pill import FloatingPillWidget
 from localflow.ui.settings_window import SettingsWindow
 from localflow.ui.theme import resolve_theme
@@ -99,6 +106,10 @@ class LocalFlowController(QObject):
     _partial_text_ready = Signal(int, str)  # session_gen, partial_text
     _auto_stop_requested = Signal(int)  # session_gen
     _ollama_start_status = Signal(bool, str)  # ready_ok, notice_text
+    _meeting_stopped_done = Signal(int)  # meeting_id
+    _meeting_warning_signal = Signal(str)
+    _meeting_summary_step = Signal(int, str, int, int)  # meeting_id, stage, step, total
+    _meeting_summary_done = Signal(int, bool, str)  # meeting_id, too_short, err
 
     def __init__(self, app: QApplication) -> None:
         super().__init__()
@@ -107,10 +118,12 @@ class LocalFlowController(QObject):
         self._config = load_config()
         self._lang: LanguageCode = normalize_language(self._config.language)
         self._storage = HistoryStorage()
+        self._meeting_storage = MeetingStorage()
         self._state = AppState.IDLE
         self._asr_load_gen = 0
         self._session_gen = 0
         self._chunked_session: ChunkedASRSession | None = None
+        self._dictation_using_meeting_tap = False
         self._pending_window_context: ActiveWindowContext | None = None
         self._pending_selected_text: str | None = None
         self._is_command_mode = False
@@ -119,6 +132,8 @@ class LocalFlowController(QObject):
         self._asr_status_obj: ASRStatus | None = None
         self._asr_downloading = False
         self._asr_download_pct = -1
+        self._asr_load_started_at = 0.0
+        self._start_recording_when_ready = False
         self._ollama_start_prompted = False
         self._asr_status_text = tr("menu.asr_loading_model", self._lang, model=self._config.whisper_model)
         recent = self._storage.list_recent(limit=1)
@@ -130,15 +145,32 @@ class LocalFlowController(QObject):
         self._snooze_timer.setSingleShot(True)
         self._snooze_timer.timeout.connect(self._on_unsnooze)
 
+        self._warming_timer = QTimer(self)
+        self._warming_timer.setInterval(250)
+        self._warming_timer.timeout.connect(self._update_warming_pill)
+
         self._history_cleanup_timer = QTimer(self)
         self._history_cleanup_timer.setInterval(60_000)
         self._history_cleanup_timer.timeout.connect(self._run_history_auto_cleanup)
         self._history_cleanup_timer.start()
 
         self._recorder = AudioRecorder()
+        self._meeting_recorder = MeetingAudioRecorder()
         self._injector = Win32TextInjector()
         self._asr = self._build_asr(self._config)
         self._polisher = self._build_polisher(self._config)
+        self._meeting_session = MeetingSession(
+            storage=self._meeting_storage,
+            whisper_engine=self._asr,
+            recorder=self._meeting_recorder,
+            vocabulary=parse_vocabulary(self._config.custom_vocabulary),
+            whisper_prompt=self._config.whisper_initial_prompt,
+            diarization_enabled=self._config.notetaker_diarization_enabled,
+            lang=self._lang,
+        )
+        self._meeting_pill_timer = QTimer(self)
+        self._meeting_pill_timer.setInterval(1000)
+        self._meeting_pill_timer.timeout.connect(self._on_meeting_pill_tick)
 
         initial_pos = (
             (self._config.pill_x, self._config.pill_y)
@@ -149,7 +181,13 @@ class LocalFlowController(QObject):
         self._pill = FloatingPillWidget(initial_pos=initial_pos)
         self._pill.set_theme(resolved_theme)
         self._pill.set_language(self._lang)
-        self._pill.set_level_provider(lambda: self._recorder.latest_level)
+        self._pill.set_level_provider(
+            lambda: (
+                self._meeting_recorder.mic_level
+                if self._dictation_using_meeting_tap
+                else self._recorder.latest_level
+            )
+        )
         self._pill.set_live_preview_enabled(self._config.live_preview_enabled)
         self._pill.set_idle_bar_enabled(self._config.show_idle_bar)
         self._pill.set_has_last_dictation(bool(self._last_dictation_text))
@@ -165,7 +203,42 @@ class LocalFlowController(QObject):
             self._tray.set_last_dictation_preview(self._last_dictation_text)
         if self._last_raw_text:
             self._tray.set_last_raw_preview(self._last_raw_text)
-        self._settings = SettingsWindow(self._config, self._storage)
+        self._settings = SettingsWindow(self._config, self._storage, self._meeting_storage)
+        self._meeting_window = MeetingSideWindow(
+            self._meeting_storage,
+            llm_factory=lambda: self._polisher if self._config.llm_enabled else None,
+            lang=self._lang,
+            theme=resolved_theme,
+        )
+        nt = self._settings.notetaker_tab
+        mw = self._meeting_window.workspace
+        llm_getter = lambda: self._polisher if self._config.llm_enabled else None
+        lvl_getter = lambda: (
+            self._meeting_recorder.mic_level,
+            self._meeting_recorder.system_level,
+            self._meeting_recorder.elapsed_sec,
+        )
+        nt.set_llm_factory(llm_getter)
+        nt.set_level_provider(lvl_getter)
+        mw.set_llm_factory(llm_getter)
+        mw.set_level_provider(lvl_getter)
+
+        def _on_utt(utt, spk) -> None:
+            nt.notify_utterance(utt.meeting_id, utt, spk)
+            mw.notify_utterance(utt.meeting_id, utt, spk)
+
+        def _on_interim(mid: int, ch: str, spk_key: str, txt: str) -> None:
+            nt.notify_interim_text(mid, ch, spk_key, txt)
+            mw.notify_interim_text(mid, ch, spk_key, txt)
+
+        def _on_spks(mid: int) -> None:
+            nt.notify_speakers_updated(mid)
+            mw.notify_speakers_updated(mid)
+
+        self._meeting_session.on_utterance = _on_utt
+        self._meeting_session.on_interim_text = _on_interim
+        self._meeting_session.on_speakers_updated = _on_spks
+        self._meeting_session.on_warning = self._meeting_warning_signal.emit
         self._hotkey = GlobalHotkeyListener(threshold_ms=self._config.double_tap_ms)
 
         self._connect_signals()
@@ -203,6 +276,7 @@ class LocalFlowController(QObject):
         self._lang = normalize_language(lang)
         self._pill.set_language(self._lang)
         self._tray.set_language(self._lang)
+        self._meeting_window.retranslate(self._lang)
         self._refresh_asr_status_label()
 
     def _on_language_preview(self, lang: str) -> None:
@@ -214,11 +288,13 @@ class LocalFlowController(QObject):
         self._pill.set_theme(resolved)
         self._tray.set_theme(resolved)
         self._settings.apply_theme(mode)
+        self._meeting_window.set_theme(resolved)
 
     def _on_theme_preview(self, mode: str) -> None:
         resolved = resolve_theme(mode)
         self._pill.set_theme(resolved)
         self._tray.set_theme(resolved)
+        self._meeting_window.set_theme(resolved)
 
     def _on_system_theme_changed(self, *_args) -> None:
         if not self._shutting_down and self._config.theme == "system":
@@ -307,6 +383,7 @@ class LocalFlowController(QObject):
         self._tray.reset_position_requested.connect(self._on_reset_pill_position)
         self._tray.copy_last_dictation_requested.connect(self._on_copy_last_dictation)
         self._tray.copy_last_raw_requested.connect(self._on_copy_last_raw)
+        self._tray.meeting_toggle_requested.connect(self._on_toggle_meeting_default)
         self._tray.quit_requested.connect(self.shutdown)
 
         self._pill.position_changed.connect(self._on_pill_moved)
@@ -314,7 +391,36 @@ class LocalFlowController(QObject):
         self._pill.cancel_requested.connect(self._on_cancel)
         self._pill.copy_last_requested.connect(self._on_copy_last_dictation)
         self._pill.download_clicked.connect(self._open_first_run_setup)
+        self._pill.meeting_clicked.connect(self._open_active_or_hub_meeting)
         self._pill.context_menu_requested.connect(self._on_pill_context_menu)
+
+        nt = self._settings.notetaker_tab
+        mw = self._meeting_window.workspace
+        nt.start_meeting_requested.connect(self.start_meeting)
+        nt.stop_meeting_requested.connect(self.stop_meeting)
+        nt.resume_meeting_requested.connect(self.resume_meeting)
+        nt.regenerate_summary_requested.connect(self._run_meeting_summary_async)
+        nt.open_side_window_requested.connect(
+            lambda mid: self._meeting_window.open_for_meeting(
+                mid, recording=(self._meeting_session.is_active and self._meeting_session.active_meeting is not None and self._meeting_session.active_meeting.id == mid)
+            )
+        )
+        nt.meeting_updated.connect(self._sync_side_window_from_hub)
+
+        mw.start_meeting_requested.connect(self.start_meeting)
+        mw.stop_meeting_requested.connect(self.stop_meeting)
+        mw.resume_meeting_requested.connect(self.resume_meeting)
+        mw.regenerate_summary_requested.connect(self._run_meeting_summary_async)
+        mw.meeting_updated.connect(self._sync_hub_from_side_window)
+        mw.delete_meeting_requested.connect(lambda _mid: nt.refresh_meetings())
+        self._meeting_window.back_to_hub_requested.connect(self._settings.show_notetaker)
+
+        self._meeting_stopped_done.connect(self._on_meeting_stopped_ui)
+        self._meeting_summary_step.connect(self._on_meeting_summary_step_ui, Qt.ConnectionType.QueuedConnection)
+        self._meeting_summary_done.connect(self._on_meeting_summary_done_ui, Qt.ConnectionType.QueuedConnection)
+        self._meeting_warning_signal.connect(
+            lambda msg: self._pill.show_notice(msg[:48], is_error=True, duration_ms=2600)
+        )
 
         self._settings.config_saved.connect(self._on_config_saved)
         self._settings.history_retention_changed.connect(self._on_history_retention_changed)
@@ -364,6 +470,7 @@ class LocalFlowController(QObject):
         dl_lang = self._lang
         self._asr_status_kind = "loading"
         self._asr_status_obj = None
+        self._asr_load_started_at = time.monotonic()
         self._refresh_asr_status_label()
 
         needs_download = find_local_whisper_model_path(model_name) is None
@@ -432,27 +539,70 @@ class LocalFlowController(QObject):
         if self._state == AppState.IDLE and not self._asr_downloading:
             self._restore_pill_idle()
 
+    def _update_warming_pill(self) -> None:
+        if self._shutting_down or self._asr.status.ready or self._asr_downloading:
+            self._warming_timer.stop()
+            return
+        if self._state != AppState.IDLE:
+            return
+        elapsed = max(0.0, time.monotonic() - self._asr_load_started_at)
+        remaining = max(0.0, float(self._config.last_asr_load_sec) - elapsed)
+        sec = int(math.ceil(remaining))
+        if sec >= 1:
+            base = tr("pill.warming_queued" if self._start_recording_when_ready else "pill.warming", self._lang)
+            text = tr("pill.warming_sec", self._lang, label=base, sec=sec)
+        else:
+            text = tr("pill.warming_almost", self._lang)
+        self._pill.show_warming(text, queued=self._start_recording_when_ready)
+
     def _on_asr_loaded(self, gen: int, status: ASRStatus) -> None:
         if gen != self._asr_load_gen:
             return
         was_downloading = self._asr_downloading
+        queued_start = self._start_recording_when_ready
+        was_warming = self._warming_timer.isActive()
+        self._warming_timer.stop()
+        self._start_recording_when_ready = False
+
+        if self._asr_load_started_at > 0 and not was_downloading:
+            measured = max(1.5, min(30.0, time.monotonic() - self._asr_load_started_at))
+            if abs(measured - self._config.last_asr_load_sec) >= 0.5:
+                self._config = self._config.model_copy(update={"last_asr_load_sec": round(measured, 1)})
+                try:
+                    save_config(self._config)
+                except Exception:
+                    pass
+
         self._asr_downloading = False
         self._asr_download_pct = -1
+        self._asr_load_started_at = 0.0
         self._ollama_start_prompted = False
         self._settings.clear_external_download()
         self._asr_status_kind = "ready"
         self._asr_status_obj = status
         self._refresh_asr_status_label()
-        if was_downloading and self._state == AppState.IDLE:
-            self._pill.show_notice(tr("onboarding.pill_ready", self._lang), duration_ms=3000)
         if self._config.llm_enabled and self._config.ollama_warmup_on_start:
             self._pool.start(_FnWorker(self._polisher.warmup))
+
+        if queued_start and self._state == AppState.IDLE:
+            self._hotkey.set_recording_active(False)
+            self._start_recording()
+            return
+
+        if was_downloading and self._state == AppState.IDLE:
+            self._pill.show_notice(tr("onboarding.pill_ready", self._lang), duration_ms=3000)
+        elif was_warming and self._state == AppState.IDLE:
+            self._pill.show_notice(tr("pill.ready", self._lang), duration_ms=1400)
 
     def _on_asr_failed(self, gen: int, err: str) -> None:
         if gen != self._asr_load_gen:
             return
+        self._warming_timer.stop()
+        self._start_recording_when_ready = False
+        self._hotkey.set_recording_active(False)
         self._asr_downloading = False
         self._asr_download_pct = -1
+        self._asr_load_started_at = 0.0
         self._ollama_start_prompted = False
         self._settings.clear_external_download()
         self._asr_status_kind = "error"
@@ -472,10 +622,173 @@ class LocalFlowController(QObject):
         self._pill.set_idle_bar_enabled(show_idle)
         if self._state != AppState.IDLE:
             return
+        if self._meeting_session.is_active:
+            self._pill.show_meeting(self._meeting_recorder.elapsed_sec)
+            return
         if show_idle:
             self._pill.show_idle_bar()
         else:
             self._pill.hide_pill()
+
+    def _on_meeting_pill_tick(self) -> None:
+        if self._meeting_session.is_active and self._state == AppState.IDLE:
+            self._pill.show_meeting(self._meeting_recorder.elapsed_sec)
+
+    def _on_toggle_meeting_default(self) -> None:
+        if self._meeting_session.is_active:
+            self.stop_meeting()
+        else:
+            self.start_meeting(self._config.notetaker_audio_mode)
+
+    def start_meeting(self, audio_mode: str = "dual") -> None:
+        if self._meeting_session.is_active:
+            return
+        if not self._asr.status.ready:
+            self._pill.show_notice(tr("notice.model_loading", self._lang), is_error=True, duration_ms=2000)
+            return
+        mode: AudioMode = "mic_only" if audio_mode == "mic_only" else "dual"
+        self._meeting_session.whisper_engine = self._asr
+        self._meeting_session.vocabulary = parse_vocabulary(self._config.custom_vocabulary)
+        self._meeting_session.whisper_prompt = self._config.whisper_initial_prompt
+        self._meeting_session.diarization_enabled = self._config.notetaker_diarization_enabled
+        self._meeting_session.lang = self._lang
+        try:
+            meeting = self._meeting_session.start(
+                audio_mode=mode,
+                mic_device_index=self._config.audio_device_index,
+                loopback_device_index=self._config.notetaker_loopback_device_index,
+            )
+        except Exception as exc:
+            logger.exception("Failed to start meeting")
+            self._pill.show_notice(
+                tr("notice.mic_error", self._lang, err=str(exc)[:30]),
+                is_error=True,
+                duration_ms=2500,
+            )
+            return
+        self._tray.set_meeting_active(True)
+        self._settings.notetaker_tab.set_recording_state(True, meeting.id)
+        self._meeting_window.open_for_meeting(meeting.id, recording=True)
+        self._meeting_pill_timer.start()
+        self._restore_pill_idle()
+
+    def resume_meeting(self, meeting_id: int) -> None:
+        if self._meeting_session.is_active:
+            return
+        if not self._asr.status.ready:
+            self._pill.show_notice(tr("notice.model_loading", self._lang), is_error=True, duration_ms=2000)
+            return
+        self._meeting_session.whisper_engine = self._asr
+        self._meeting_session.vocabulary = parse_vocabulary(self._config.custom_vocabulary)
+        self._meeting_session.whisper_prompt = self._config.whisper_initial_prompt
+        self._meeting_session.diarization_enabled = self._config.notetaker_diarization_enabled
+        self._meeting_session.lang = self._lang
+        try:
+            meeting = self._meeting_session.resume(
+                meeting_id,
+                mic_device_index=self._config.audio_device_index,
+                loopback_device_index=self._config.notetaker_loopback_device_index,
+            )
+        except Exception as exc:
+            logger.exception("Failed to resume meeting")
+            self._pill.show_notice(
+                tr("notice.mic_error", self._lang, err=str(exc)[:30]),
+                is_error=True,
+                duration_ms=2500,
+            )
+            return
+        if meeting is None:
+            return
+        self._tray.set_meeting_active(True)
+        self._settings.notetaker_tab.set_recording_state(True, meeting.id)
+        self._meeting_window.open_for_meeting(meeting.id, recording=True)
+        self._meeting_pill_timer.start()
+        self._restore_pill_idle()
+
+    def _open_active_or_hub_meeting(self) -> None:
+        active = self._meeting_session.active_meeting
+        if active is not None:
+            self._meeting_window.open_for_meeting(active.id, recording=True)
+        else:
+            self._settings.show_notetaker()
+
+    def _sync_hub_from_side_window(self, mid: int) -> None:
+        nt = self._settings.notetaker_tab
+        if nt.workspace.current_meeting_id == mid:
+            nt.workspace.set_meeting(mid)
+        nt._refresh_list_labels_only()
+
+    def _sync_side_window_from_hub(self, mid: int) -> None:
+        mw = self._meeting_window.workspace
+        if mw.current_meeting_id == mid:
+            mw.set_meeting(mid)
+
+    def stop_meeting(self) -> None:
+        if not self._meeting_session.is_active:
+            return
+        active = self._meeting_session.active_meeting
+        mid = active.id if active is not None else None
+        self._meeting_pill_timer.stop()
+        self._tray.set_meeting_active(False)
+        self._settings.notetaker_tab.set_recording_state(False, None)
+        self._meeting_window.workspace.set_recording_state(False, None)
+        if mid is not None:
+            self._settings.notetaker_tab.notify_summary_step(mid, "refine", 1, 2)
+            self._meeting_window.workspace.set_summary_step(mid, "refine", 1, 2)
+        self._restore_pill_idle()
+
+        def _worker() -> None:
+            rec = self._meeting_session.stop()
+            if rec is not None:
+                self._meeting_stopped_done.emit(rec.id)
+
+        self._pool.start(_FnWorker(_worker))
+
+    def _on_meeting_stopped_ui(self, meeting_id: int) -> None:
+        self._restore_pill_idle()
+        self._settings.notetaker_tab.refresh_meetings(select_id=meeting_id)
+        self._meeting_window.workspace.set_meeting(meeting_id)
+        if self._config.llm_enabled:
+            self._run_meeting_summary_async(meeting_id, force=False)
+        else:
+            self._meeting_summary_done.emit(meeting_id, False, "")
+
+    def _run_meeting_summary_async(self, meeting_id: int, force: bool = False) -> None:
+        if not self._config.llm_enabled:
+            self._meeting_summary_done.emit(meeting_id, False, tr("notetaker.llm_unavailable", self._lang))
+            return
+        target_lang = self._lang
+        polisher = self._polisher
+        storage = self._meeting_storage
+        self._meeting_storage.update_meeting(meeting_id, status="summarizing")
+        self._meeting_summary_step.emit(meeting_id, "analyze", 1, 2)
+
+        def _worker() -> None:
+            try:
+                summarizer = MeetingSummarizer(polisher)  # type: ignore[arg-type]
+                res = summarizer.summarize_meeting(
+                    storage,
+                    meeting_id,
+                    lang=target_lang,
+                    force=force,
+                    on_step=lambda stage, step, total: self._meeting_summary_step.emit(
+                        meeting_id, stage, step, total
+                    ),
+                )
+                self._meeting_summary_done.emit(meeting_id, res.too_short, "")
+            except Exception as exc:
+                storage.update_meeting(meeting_id, status="error")
+                self._meeting_summary_done.emit(meeting_id, False, str(exc))
+
+        threading.Thread(target=_worker, name="LocalFlow-MeetingSummary", daemon=True).start()
+
+    def _on_meeting_summary_step_ui(self, meeting_id: int, stage: str, step: int, total: int) -> None:
+        self._settings.notetaker_tab.notify_summary_step(meeting_id, stage, step, total)
+        self._meeting_window.workspace.set_summary_step(meeting_id, stage, step, total)
+
+    def _on_meeting_summary_done_ui(self, meeting_id: int, too_short: bool, err: str) -> None:
+        self._settings.notetaker_tab.notify_summary_done(meeting_id, too_short=too_short, error=err)
+        self._meeting_window.workspace.set_summary_done(meeting_id, too_short=too_short, error=err)
 
     def _set_state(self, state: AppState) -> None:
         self._state = state
@@ -667,11 +980,16 @@ class LocalFlowController(QObject):
         )
 
         try:
-            self._recorder.start(
-                device_index=self._config.audio_device_index,
-                silence_auto_stop_sec=silence_sec,
-                on_silence_timeout=on_timeout,
-            )
+            if self._meeting_session.is_active:
+                self._meeting_recorder.start_dictation_tap()
+                self._dictation_using_meeting_tap = True
+            else:
+                self._dictation_using_meeting_tap = False
+                self._recorder.start(
+                    device_index=self._config.audio_device_index,
+                    silence_auto_stop_sec=silence_sec,
+                    on_silence_timeout=on_timeout,
+                )
         except Exception as exc:
             logger.exception("Microphone start error")
             self._pill.show_notice(
@@ -693,6 +1011,12 @@ class LocalFlowController(QObject):
         self._pool.start(_FnWorker(self._polisher.warmup))
 
     def _on_cancel(self) -> None:
+        if self._start_recording_when_ready and self._state == AppState.IDLE:
+            self._start_recording_when_ready = False
+            self._warming_timer.stop()
+            self._hotkey.set_recording_active(False)
+            self._restore_pill_idle()
+            return
         if self._state != AppState.RECORDING:
             return
         self._session_gen += 1
@@ -703,7 +1027,11 @@ class LocalFlowController(QObject):
         self._is_command_mode = False
         if session is not None:
             session.cancel()
-        self._recorder.stop()
+        if self._dictation_using_meeting_tap:
+            self._dictation_using_meeting_tap = False
+            self._meeting_recorder.stop_dictation_tap()
+        else:
+            self._recorder.stop()
         self._set_state(AppState.IDLE)
         self._pill.show_notice(tr("notice.cancelled", self._lang), duration_ms=1100)
         if self._config.play_sounds:
@@ -716,9 +1044,10 @@ class LocalFlowController(QObject):
                     f"Whisper {self._config.whisper_model}", self._asr_download_pct
                 )
             else:
-                self._pill.show_notice(
-                    tr("notice.model_loading", self._lang), is_error=True, duration_ms=1800
-                )
+                self._start_recording_when_ready = True
+                self._hotkey.set_recording_active(True)
+                self._warming_timer.start()
+                self._update_warming_pill()
             return
         if not self._check_ollama_ready_on_first_dictation():
             return
@@ -740,15 +1069,23 @@ class LocalFlowController(QObject):
         )
 
         try:
-            self._recorder.start(
-                device_index=self._config.audio_device_index,
-                pause_ms=750,
-                silence_auto_stop_sec=silence_sec,
-                on_segment=session.submit,
-                on_silence_timeout=on_timeout,
-            )
+            if self._meeting_session.is_active:
+                self._meeting_recorder.start_dictation_tap()
+                self._dictation_using_meeting_tap = True
+                session.cancel()
+                session = None
+            else:
+                self._dictation_using_meeting_tap = False
+                self._recorder.start(
+                    device_index=self._config.audio_device_index,
+                    pause_ms=750,
+                    silence_auto_stop_sec=silence_sec,
+                    on_segment=session.submit,
+                    on_silence_timeout=on_timeout,
+                )
         except Exception as exc:
-            session.cancel()
+            if session is not None:
+                session.cancel()
             logger.exception("Microphone start error")
             self._pill.show_notice(
                 tr("notice.mic_error", self._lang, err=str(exc)[:30]),
@@ -785,7 +1122,14 @@ class LocalFlowController(QObject):
         self._is_command_mode = False
 
         full_audio = np.zeros(0, dtype=np.float32)
-        if session is not None:
+        if self._dictation_using_meeting_tap:
+            self._dictation_using_meeting_tap = False
+            audio = self._meeting_recorder.stop_dictation_tap()
+            duration_sec = float(audio.size) / 16000.0
+            if session is not None:
+                session.cancel()
+                session = None
+        elif session is not None:
             if hasattr(self._recorder, "stop_chunked_with_full_audio"):
                 audio, full_audio, duration_sec = self._recorder.stop_chunked_with_full_audio()
             else:
@@ -926,6 +1270,7 @@ class LocalFlowController(QObject):
                         final_text = apply_style_postprocessing(final_text, active_style)
                         final_text = strip_long_dashes(final_text)
 
+                final_text = strip_final_period(final_text)
                 is_term = bool(
                     window_ctx is not None
                     and window_ctx.app_name in ("Terminal", "PowerShell", "Command Prompt")
@@ -938,6 +1283,8 @@ class LocalFlowController(QObject):
                         restore_clipboard=cfg.paste_restore_clipboard,
                         paste_delay_ms=cfg.paste_delay_ms,
                         is_terminal=is_term,
+                        smart_inline_case=cfg.smart_inline_case_enabled,
+                        preserve_words=vocab.terms,
                     )
                 except TypeError:
                     injector.inject(
@@ -1032,6 +1379,7 @@ class LocalFlowController(QObject):
             is_snoozed=self._snooze_timer.isActive(),
             last_dictation_preview=self._last_dictation_text,
             last_raw_preview=self._last_raw_text,
+            is_meeting_active=self._meeting_session.is_active,
         )
         callbacks = QuickMenuCallbacks(
             on_select_mic=self._on_mic_selected,
@@ -1045,6 +1393,7 @@ class LocalFlowController(QObject):
             on_copy_last_dictation=self._on_copy_last_dictation,
             on_copy_last_raw=self._on_copy_last_raw,
             on_open_settings=self._settings.show_and_focus,
+            on_toggle_meeting=self._on_toggle_meeting_default,
             on_quit=self.shutdown,
         )
         menu = build_quick_menu(
@@ -1217,6 +1566,8 @@ class LocalFlowController(QObject):
         except Exception:
             pass
         self._session_gen += 1
+        self._warming_timer.stop()
+        self._start_recording_when_ready = False
         self._hotkey.stop()
         session = self._chunked_session
         self._chunked_session = None
@@ -1224,11 +1575,15 @@ class LocalFlowController(QObject):
             session.cancel()
         if self._recorder.is_recording:
             self._recorder.stop()
+        if self._meeting_session.is_active:
+            self._meeting_pill_timer.stop()
+            self._meeting_session.stop()
         self._pending_window_context = None
         self._pending_selected_text = None
         self._is_command_mode = False
         self._polisher.close()
         self._tray.hide()
         self._pill.hide()
+        self._meeting_window.hide()
         self._pool.waitForDone(1000)
         self._app.quit()

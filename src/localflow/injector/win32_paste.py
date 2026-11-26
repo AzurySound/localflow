@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wintypes
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
@@ -430,6 +431,139 @@ def _peek_left_char(*, is_terminal: bool = False) -> str | None:
     return None
 
 
+_FIRST_TOKEN_RE = re.compile(r"^([^\w]*)([\w'-]+)(.*)$", re.DOTALL | re.UNICODE)
+
+
+def is_mid_sentence(left_ctx: str | None, right_ctx: str | None = None) -> bool:
+    """Return True when the caret is inside a sentence or at the end of an unfinished sentence."""
+    if not left_ctx:
+        return False
+    if left_ctx.endswith(("\n", "\r")):
+        return False
+    stripped_left = left_ctx.rstrip(" \t")
+    if not stripped_left:
+        return False
+    last_ch = stripped_left[-1]
+    if last_ch in ".!?…:":
+        return False
+    if last_ch.isalnum() or last_ch in ",;-–—(«\"'/_":
+        return True
+    if right_ctx and right_ctx.lstrip(" \t")[:1].islower():
+        return True
+    return False
+
+
+def _should_preserve_first_word_case(word: str, preserve_words: Iterable[str] = ()) -> bool:
+    if not word:
+        return True
+    if word in {"I", "I'm", "I'll", "I've", "I'd"}:
+        return True
+    upper_count = sum(1 for ch in word if ch.isupper())
+    if upper_count >= 2:
+        return True
+    preserve_set = {w.strip().casefold() for w in preserve_words if w and w.strip()[:1].isupper()}
+    clean_fold = word.strip("-'\"").casefold()
+    if clean_fold and clean_fold in preserve_set:
+        return True
+    return False
+
+
+def adapt_text_for_inline_insertion(
+    text: str,
+    left_ctx: str | None,
+    right_ctx: str | None = None,
+    *,
+    preserve_words: Iterable[str] = (),
+) -> str:
+    """Lowercase leading word, drop final period, and add trailing space when inserting mid-sentence."""
+    if not text:
+        return text
+    if not is_mid_sentence(left_ctx, right_ctx):
+        return text
+
+    out = text
+    if "\n" not in out:
+        if out.endswith(".") and not out.endswith(".."):
+            if not (len(out) >= 2 and out[-2].isdigit()):
+                out = out[:-1]
+
+        m = _FIRST_TOKEN_RE.match(out)
+        if m:
+            lead, word, rest = m.group(1), m.group(2), m.group(3)
+            if word[0].isupper() and not _should_preserve_first_word_case(word, preserve_words):
+                out = lead + word[0].lower() + word[1:] + rest
+
+    if right_ctx and not out.endswith((" ", "\t", "\n")):
+        r0 = right_ctx[0]
+        if not r0.isspace() and r0 not in ".,!?;:)]}»\"'":
+            out = out + " "
+    return out
+
+
+def _peek_surrounding_context(
+    *,
+    is_terminal: bool = False,
+    left_chars: int = 3,
+) -> tuple[str | None, str | None]:
+    """Peek up to `left_chars` before the caret and 1 char after the caret without losing caret position."""
+    if is_terminal:
+        return (_peek_left_char(is_terminal=True), None)
+
+    left_ctx: str | None = None
+    right_ctx: str | None = None
+
+    # 1. Peek left context
+    if clear_clipboard():
+        _release_held_modifiers()
+        seq_before = user32.GetClipboardSequenceNumber()
+        _send_keys([(VK_LSHIFT, False)])
+        time.sleep(0.010)
+        for _ in range(max(1, left_chars)):
+            _send_keys([(VK_LEFT, False), (VK_LEFT, True)])
+            time.sleep(0.005)
+        _send_keys([(VK_LSHIFT, True)])
+        time.sleep(0.012)
+        send_ctrl_c()
+
+        deadline = time.monotonic() + 0.140
+        while time.monotonic() < deadline:
+            if user32.GetClipboardSequenceNumber() != seq_before:
+                break
+            time.sleep(0.004)
+
+        copied = get_clipboard_text()
+        if copied:
+            _send_keys([(VK_RIGHT, False), (VK_RIGHT, True)])
+            time.sleep(0.012)
+            left_ctx = copied.replace("\r\n", "\n")
+
+    # 2. Peek 1 char to the right of caret
+    if clear_clipboard():
+        _release_held_modifiers()
+        seq_before = user32.GetClipboardSequenceNumber()
+        _send_keys([(VK_LSHIFT, False)])
+        time.sleep(0.010)
+        _send_keys([(VK_RIGHT, False), (VK_RIGHT, True)])
+        time.sleep(0.010)
+        _send_keys([(VK_LSHIFT, True)])
+        time.sleep(0.012)
+        send_ctrl_c()
+
+        deadline = time.monotonic() + 0.110
+        while time.monotonic() < deadline:
+            if user32.GetClipboardSequenceNumber() != seq_before:
+                break
+            time.sleep(0.004)
+
+        copied_r = get_clipboard_text()
+        if copied_r:
+            _send_keys([(VK_LEFT, False), (VK_LEFT, True)])
+            time.sleep(0.012)
+            right_ctx = copied_r.replace("\r\n", "\n")[:1]
+
+    return (left_ctx, right_ctx)
+
+
 class Win32TextInjector:
     """Captures selected text and pastes text into the active window via clipboard + Ctrl+C/V."""
 
@@ -442,6 +576,7 @@ class Win32TextInjector:
         get_async_key_state: Callable[[int], int] | None = None,
         send_keys: Callable[[list[tuple[int, bool]]], None] | None = None,
         peek_left_char: Callable[[], str | None] | None = None,
+        peek_surrounding_context: Callable[[], tuple[str | None, str | None]] | None = None,
         has_active_selection: Callable[[], bool] | None = None,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
@@ -452,6 +587,7 @@ class Win32TextInjector:
         self._get_async_key_state = get_async_key_state
         self._send_keys = send_keys
         self._peek_left_char = peek_left_char
+        self._peek_surrounding_context = peek_surrounding_context
         self._has_active_selection = has_active_selection
         self._monotonic = monotonic
         self._sleep = sleep
@@ -534,6 +670,8 @@ class Win32TextInjector:
         restore_clipboard: bool = True,
         paste_delay_ms: int = 120,
         is_terminal: bool = False,
+        smart_inline_case: bool = True,
+        preserve_words: Iterable[str] = (),
     ) -> bool:
         if not text:
             return False
@@ -548,11 +686,11 @@ class Win32TextInjector:
             if self._has_active_selection is not None:
                 has_selection = self._has_active_selection()
             elif (
-                self._peek_left_char is not None
+                (self._peek_left_char is not None or self._peek_surrounding_context is not None)
                 and self._send_keys is None
                 and self._get_clipboard_sequence_number is None
             ):
-                # Preserve legacy unit tests that inject only a custom peek_left_char double
+                # Preserve legacy unit tests that inject only a custom peek double
                 has_selection = False
             else:
                 has_selection = _has_active_selection_win32(
@@ -566,11 +704,23 @@ class Win32TextInjector:
                 )
 
             if not has_selection:
-                left_char = (
-                    self._peek_left_char()
-                    if self._peek_left_char is not None
-                    else _peek_left_char(is_terminal=is_terminal)
-                )
+                if self._peek_surrounding_context is not None:
+                    left_ctx, right_ctx = self._peek_surrounding_context()
+                elif self._peek_left_char is not None:
+                    left_ctx, right_ctx = self._peek_left_char(), None
+                elif smart_inline_case and not is_terminal:
+                    left_ctx, right_ctx = _peek_surrounding_context(is_terminal=is_terminal)
+                else:
+                    left_ctx, right_ctx = _peek_left_char(is_terminal=is_terminal), None
+
+                if smart_inline_case and not is_terminal:
+                    text = adapt_text_for_inline_insertion(
+                        text,
+                        left_ctx,
+                        right_ctx,
+                        preserve_words=preserve_words,
+                    )
+                left_char = left_ctx[-1] if left_ctx else None
                 if should_prepend_space(left_char, text):
                     text = " " + text
 
