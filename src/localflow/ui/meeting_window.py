@@ -9,11 +9,12 @@ import re
 import threading
 from typing import Callable
 
-from PySide6.QtCore import QPoint, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -44,7 +45,15 @@ from localflow.notetaker.storage import (
     MeetingUtterance,
     format_timestamp,
 )
-from localflow.ui.theme import ResolvedTheme
+from localflow.ui.icons import render_icon
+from localflow.ui.theme import (
+    ResolvedTheme,
+    apply_windows_titlebar_theme,
+    build_dialog_stylesheet,
+    build_menu_stylesheet,
+    get_theme_tokens,
+)
+from localflow.ui.widgets import CheckmarkProxyStyle, FramelessWindowHelper
 
 _SPEAKER_COLORS_DARK = (
     "#fafafa",  # you (clean crisp label in editorial view; plum bubble during live)
@@ -205,14 +214,16 @@ class SummaryProgressCard(QFrame):
 
 
 def _bubble_colors(is_self: bool, is_interim: bool, theme: ResolvedTheme) -> tuple[str, str]:
-    is_light = theme == "light"
-    if is_light:
-        if is_self:
-            return ("#f3f0ff" if is_interim else "#ede9fe", "#6d28d9" if is_interim else "#2e1065")
-        return ("#f4f4f6" if is_interim else "#eceef2", "#6b7280" if is_interim else "#18181b")
+    t = get_theme_tokens(theme)
     if is_self:
-        return ("#21192a" if is_interim else "#2d213a", "#b9adc7" if is_interim else "#f3eff7")
-    return ("#1a1d24" if is_interim else "#222630", "#9ca3af" if is_interim else "#eceef2")
+        return (
+            t["bubble_self_interim_bg"] if is_interim else t["bubble_self_bg"],
+            t["bubble_self_interim_fg"] if is_interim else t["bubble_self_fg"],
+        )
+    return (
+        t["bubble_other_interim_bg"] if is_interim else t["bubble_other_bg"],
+        t["bubble_other_interim_fg"] if is_interim else t["bubble_other_fg"],
+    )
 
 
 class _SpeechBubble(QFrame):
@@ -258,25 +269,54 @@ class _ActionItemRow(QWidget):
 
     toggled = Signal(bool)
 
-    def __init__(self, label: str, *, checked: bool, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        label: str,
+        *,
+        checked: bool,
+        theme: ResolvedTheme = "dark",
+        check_style: CheckmarkProxyStyle | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._theme: ResolvedTheme = theme
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 3, 0, 3)
         lay.setSpacing(8)
 
         self._cb = QCheckBox("")
+        if check_style is not None:
+            self._cb.setStyle(check_style)
         self._cb.setChecked(checked)
-        self._cb.setFixedWidth(20)
-        self._cb.toggled.connect(self.toggled.emit)
+        self._cb.setFixedSize(20, 20)
+        self._cb.toggled.connect(self._on_cb_toggled)
 
         self._lbl = QLabel(label)
         self._lbl.setWordWrap(True)
         self._lbl.setMinimumWidth(0)
         self._lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._lbl.setStyleSheet("QLabel { font-size: 13px; background: transparent; }")
+        self._sync_label_style(checked)
 
         lay.addWidget(self._cb, 0, Qt.AlignmentFlag.AlignTop)
         lay.addWidget(self._lbl, 1)
+
+    def set_theme(self, theme: ResolvedTheme) -> None:
+        self._theme = theme
+        self._sync_label_style(self._cb.isChecked())
+
+    def _on_cb_toggled(self, checked: bool) -> None:
+        self._sync_label_style(checked)
+        self.toggled.emit(checked)
+
+    def _sync_label_style(self, checked: bool) -> None:
+        t = get_theme_tokens(self._theme)
+        font = self._lbl.font()
+        font.setStrikeOut(checked)
+        self._lbl.setFont(font)
+        col = t["text_muted"] if checked else t["text"]
+        self._lbl.setStyleSheet(
+            f"QLabel {{ font-size: 13px; color: {col}; background: transparent; border: none; }}"
+        )
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.LeftButton:
@@ -330,6 +370,7 @@ class MeetingNoteWorkspace(QWidget):
         self._qa_scope: str = "current"
         self._diar_cancel: threading.Event | None = None
         self._level_provider: Callable[[], tuple[float, float, float]] | None = None
+        self._check_style = CheckmarkProxyStyle(self._theme)
 
         # Incremental live-transcript rendering state
         self._rendered_live_meeting_id: int | None = None
@@ -354,7 +395,7 @@ class MeetingNoteWorkspace(QWidget):
         self._copy_reset_timer = QTimer(self)
         self._copy_reset_timer.setSingleShot(True)
         self._copy_reset_timer.setInterval(1200)
-        self._copy_reset_timer.timeout.connect(lambda: self._tr_copy_btn.setText("⧉"))
+        self._copy_reset_timer.timeout.connect(self._reset_copy_icon)
 
         self._build_ui()
         self._connect_signals()
@@ -390,9 +431,13 @@ class MeetingNoteWorkspace(QWidget):
 
     def set_theme(self, theme: ResolvedTheme) -> None:
         self._theme = theme
+        self._check_style.set_theme(theme)
         self._live_wave.set_theme(theme)
         self._progress_card.set_theme(theme)
         self._apply_theme_styles()
+        self._refresh_workspace_icons()
+        for row in self._action_container.findChildren(_ActionItemRow):
+            row.set_theme(theme)
         self._render_current_meeting(force_transcript_rebuild=True)
 
     def retranslate(self, lang: str) -> None:
@@ -400,12 +445,12 @@ class MeetingNoteWorkspace(QWidget):
         self._title_edit.setPlaceholderText(tr("notetaker.title_placeholder", self._lang))
         self._tab_thoughts_btn.setText(tr("notetaker.tab.thoughts", self._lang))
         self._tab_transcript_btn.setText(tr("notetaker.tab.transcript", self._lang))
-        self._tab_summary_btn.setText(f"✦ {tr('notetaker.tab.summary', self._lang)}")
+        self._tab_summary_btn.setText(tr("notetaker.tab.summary", self._lang))
         self._thoughts_edit.setPlaceholderText(tr("notetaker.thoughts_placeholder", self._lang))
         self._tr_search_edit.setPlaceholderText(tr("notetaker.transcript_search", self._lang))
         self._live_banner_lbl.setText(tr("notetaker.live_banner", self._lang))
         self._privacy_lbl.setText(tr("notetaker.privacy_footer", self._lang))
-        self._too_short_lbl.setText(f"💡 {tr('notetaker.summary.too_short', self._lang)}")
+        self._too_short_lbl.setText(tr("notetaker.summary.too_short", self._lang))
         self._force_sum_btn.setText(tr("notetaker.summary.force", self._lang))
         self._regen_btn.setText(tr("notetaker.btn.regenerate", self._lang))
         self._action_header.setText(tr("notetaker.action_items", self._lang))
@@ -589,7 +634,8 @@ class MeetingNoteWorkspace(QWidget):
         tr_btn_lay.addWidget(self._live_wave, 0, Qt.AlignmentFlag.AlignVCenter)
         tr_btn_lay.addWidget(self._tab_transcript_btn)
 
-        self._tab_summary_btn = QPushButton("✦ Summary")
+        self._tab_summary_btn = QPushButton("Summary")
+        self._tab_summary_btn.setIconSize(QSize(13, 13))
         self._tab_summary_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
         tab_row.addWidget(self._tab_thoughts_btn)
@@ -631,9 +677,12 @@ class MeetingNoteWorkspace(QWidget):
 
         tr_top = QHBoxLayout()
         tr_top.setSpacing(6)
-        self._tr_meta_lbl = QLabel("🕒 0:00")
+        self._tr_clock_lbl = QLabel()
+        self._tr_clock_lbl.setFixedSize(14, 14)
+        self._tr_meta_lbl = QLabel("0:00")
         self._tr_meta_lbl.setObjectName("FieldHint")
         self._tr_meta_lbl.setMinimumWidth(0)
+        tr_top.addWidget(self._tr_clock_lbl)
         tr_top.addWidget(self._tr_meta_lbl)
         tr_top.addStretch(1)
 
@@ -644,17 +693,23 @@ class MeetingNoteWorkspace(QWidget):
         self._tr_search_edit.setVisible(False)
         tr_top.addWidget(self._tr_search_edit, 2)
 
-        self._tr_search_btn = QPushButton("🔍")
+        self._tr_search_btn = QPushButton()
         self._tr_search_btn.setObjectName("WisprIconBtn")
+        self._tr_search_btn.setFixedSize(26, 26)
+        self._tr_search_btn.setIconSize(QSize(14, 14))
         self._tr_search_btn.setCheckable(True)
         self._tr_search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self._tr_speakers_btn = QPushButton("👤+")
+        self._tr_speakers_btn = QPushButton()
         self._tr_speakers_btn.setObjectName("WisprIconBtn")
+        self._tr_speakers_btn.setFixedSize(26, 26)
+        self._tr_speakers_btn.setIconSize(QSize(14, 14))
         self._tr_speakers_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self._tr_copy_btn = QPushButton("⧉")
+        self._tr_copy_btn = QPushButton()
         self._tr_copy_btn.setObjectName("WisprIconBtn")
+        self._tr_copy_btn.setFixedSize(26, 26)
+        self._tr_copy_btn.setIconSize(QSize(14, 14))
         self._tr_copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
         tr_top.addWidget(self._tr_search_btn)
@@ -669,9 +724,10 @@ class MeetingNoteWorkspace(QWidget):
         self._live_banner_lbl = QLabel()
         self._live_banner_lbl.setObjectName("FieldHint")
         self._live_banner_lbl.setWordWrap(True)
-        self._live_banner_close = QPushButton("×")
+        self._live_banner_close = QPushButton()
         self._live_banner_close.setObjectName("WisprIconBtn")
         self._live_banner_close.setFixedSize(22, 22)
+        self._live_banner_close.setIconSize(QSize(11, 11))
         self._live_banner_close.setCursor(Qt.CursorShape.PointingHandCursor)
         lb_lay.addWidget(self._live_banner_lbl, 1)
         lb_lay.addWidget(self._live_banner_close)
@@ -724,7 +780,7 @@ class MeetingNoteWorkspace(QWidget):
         ts_lay = QHBoxLayout(self._too_short_card)
         ts_lay.setContentsMargins(14, 12, 14, 12)
         ts_lay.setSpacing(10)
-        self._too_short_lbl = QLabel("💡 THE MEETING WAS TOO SHORT TO SUMMARIZE.")
+        self._too_short_lbl = QLabel("THE MEETING WAS TOO SHORT TO SUMMARIZE.")
         self._too_short_lbl.setObjectName("TooShortLabel")
         self._too_short_lbl.setWordWrap(True)
         self._force_sum_btn = QPushButton("Summarize anyway")
@@ -868,16 +924,16 @@ class MeetingNoteWorkspace(QWidget):
         self._diar_done_signal.connect(self._handle_diar_done_ui)
 
     def _apply_theme_styles(self) -> None:
-        is_light = self._theme == "light"
-        bg = "#ffffff" if is_light else "#161618"
-        card_bg = "#f4f4f6" if is_light else "#1f1f23"
-        card_border = "#e4e4e7" if is_light else "#2b2b30"
-        text = "#18181b" if is_light else "#f4f4f5"
-        muted = "#6b7280" if is_light else "#8e8e98"
-        chip_bg = "#f4f4f6" if is_light else "#222226"
-        chip_border = "#d4d4d8" if is_light else "#303036"
-        hover_bg = "#e9e9ee" if is_light else "#2c2c32"
-        divider = "#e4e4e7" if is_light else "#26262a"
+        t = get_theme_tokens(self._theme)
+        bg = t["canvas_bg"]
+        card_bg = t["subtle_card_bg"]
+        card_border = t["subtle_card_border"]
+        text = t["text_strong"]
+        muted = t["text_muted"]
+        chip_bg = t["chip_bg"]
+        chip_border = t["chip_border"]
+        hover_bg = t["hover_bg"]
+        divider = t["divider"]
 
         self.setStyleSheet(
             f"""
@@ -914,6 +970,16 @@ class MeetingNoteWorkspace(QWidget):
                 letter-spacing: 0.5px;
                 color: {muted};
             }}
+            QLabel#SectionHeader {{
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 0.6px;
+                color: {t["section_hdr"]};
+            }}
+            QLabel#FieldHint {{
+                font-size: 12px;
+                color: {muted};
+            }}
             QLabel#PrivacyNotice {{
                 font-size: 11px;
                 color: {muted};
@@ -937,7 +1003,7 @@ class MeetingNoteWorkspace(QWidget):
                 border: none;
                 border-radius: 6px;
                 color: {muted};
-                padding: 3px 6px;
+                padding: 3px;
                 font-size: 13px;
             }}
             QPushButton#WisprIconBtn:hover, QPushButton#WisprIconBtn:checked {{
@@ -994,6 +1060,21 @@ class MeetingNoteWorkspace(QWidget):
         )
         self._tab_divider.setStyleSheet(f"background-color: {divider}; border: none;")
         self._refresh_tab_styles()
+        self._refresh_workspace_icons()
+
+    def _refresh_workspace_icons(self) -> None:
+        t = get_theme_tokens(self._theme)
+        muted = t["text_muted"]
+        self._tr_clock_lbl.setPixmap(render_icon("clock", muted, 13).pixmap(13, 13))
+        self._tr_search_btn.setIcon(render_icon("search", muted, 14))
+        self._tr_speakers_btn.setIcon(render_icon("speakers", muted, 14))
+        self._tr_copy_btn.setIcon(render_icon("copy", muted, 14))
+        self._live_banner_close.setIcon(render_icon("close", muted, 11))
+        self._update_dock_controls()
+
+    def _reset_copy_icon(self) -> None:
+        t = get_theme_tokens(self._theme)
+        self._tr_copy_btn.setIcon(render_icon("copy", t["text_muted"], 14))
 
     def _set_active_tab(self, idx: int) -> None:
         self._active_tab_idx = idx
@@ -1001,16 +1082,15 @@ class MeetingNoteWorkspace(QWidget):
         self._refresh_tab_styles()
 
     def _refresh_tab_styles(self) -> None:
-        is_light = self._theme == "light"
-        active_fg = "#111113" if is_light else "#fafafa"
-        inactive_fg = "#6b7280" if is_light else "#8a8a93"
-        underline = "#18181b" if is_light else "#fafafa"
+        t = get_theme_tokens(self._theme)
+        active_fg = t["tab_active_fg"]
+        inactive_fg = t["tab_fg"]
         buttons = (self._tab_thoughts_btn, self._tab_transcript_btn, self._tab_summary_btn)
         for i, btn in enumerate(buttons):
             if i == self._active_tab_idx:
                 btn.setStyleSheet(
                     f"QPushButton {{ background: transparent; border: none; "
-                    f"border-bottom: 2px solid {underline}; color: {active_fg}; "
+                    f"border-bottom: 2px solid {active_fg}; color: {active_fg}; "
                     "font-size: 13px; font-weight: 600; padding: 6px 2px 8px 2px; }"
                 )
             else:
@@ -1019,22 +1099,34 @@ class MeetingNoteWorkspace(QWidget):
                     f"border-bottom: 2px solid transparent; color: {inactive_fg}; "
                     "font-size: 13px; font-weight: 500; padding: 6px 2px 8px 2px; }"
                 )
+        self._tab_summary_btn.setIcon(
+            render_icon(
+                "sparkles",
+                active_fg if self._active_tab_idx == 2 else inactive_fg,
+                13,
+            )
+        )
 
     def _update_dock_controls(self) -> None:
+        t = get_theme_tokens(self._theme)
         is_current_recording = self._is_recording and self._current_meeting_id == self._recording_meeting_id
         self._privacy_lbl.setVisible(is_current_recording)
         self._qa_missed_btn.setVisible(is_current_recording and self._current_meeting_id is not None)
         self._meters_widget.setVisible(is_current_recording)
 
+        self._dock_state_btn.setIconSize(QSize(12, 12))
         if self._is_recording:
             self._dock_state_btn.setVisible(True)
-            self._dock_state_btn.setText(f"🟩 {tr('notetaker.btn.stop_short', self._lang)}")
+            self._dock_state_btn.setIcon(render_icon("stop_square", t["accent"], 12))
+            self._dock_state_btn.setText(tr("notetaker.btn.stop_short", self._lang))
         elif self._current_meeting_id is not None:
             self._dock_state_btn.setVisible(True)
-            self._dock_state_btn.setText(f"🟢 {tr('notetaker.btn.resume', self._lang)}")
+            self._dock_state_btn.setIcon(render_icon("record_dot", t["accent"], 12))
+            self._dock_state_btn.setText(tr("notetaker.btn.resume", self._lang))
         else:
             self._dock_state_btn.setVisible(self._show_bottom_start)
-            self._dock_state_btn.setText(f"● {tr('notetaker.btn.start', self._lang)}")
+            self._dock_state_btn.setIcon(render_icon("record_dot", t["accent"], 12))
+            self._dock_state_btn.setText(tr("notetaker.btn.start", self._lang))
 
     def _poll_live_meters(self) -> None:
         if not self._is_recording or self._level_provider is None:
@@ -1043,7 +1135,7 @@ class MeetingNoteWorkspace(QWidget):
         self._mic_bar.setValue(max(0, min(100, int(round(mic_lvl * 100)))))
         self._sys_bar.setValue(max(0, min(100, int(round(sys_lvl * 100)))))
         if self._current_meeting_id == self._recording_meeting_id:
-            self._tr_meta_lbl.setText(f"🕒 {format_timestamp(elapsed)}")
+            self._tr_meta_lbl.setText(format_timestamp(elapsed))
 
     def _render_current_meeting(self, *, force_transcript_rebuild: bool = False) -> None:
         mid = self._current_meeting_id
@@ -1111,6 +1203,7 @@ class MeetingNoteWorkspace(QWidget):
             item = self._speakers_lay.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
                 w.deleteLater()
 
     def _render_speakers_bar(self) -> None:
@@ -1146,6 +1239,7 @@ class MeetingNoteWorkspace(QWidget):
         if self._current_meeting_id is None:
             return
         menu = QMenu(self)
+        menu.setStyleSheet(build_menu_stylesheet(self._theme))
         rename_act = menu.addAction(tr("notetaker.speaker.rename", self._lang))
         merge_menu = menu.addMenu(tr("notetaker.speaker.merge", self._lang))
         others = [
@@ -1162,12 +1256,14 @@ class MeetingNoteWorkspace(QWidget):
         if chosen is None:
             return
         if chosen == rename_act:
-            new_name, ok = QInputDialog.getText(
-                self,
-                tr("notetaker.speaker.rename", self._lang),
-                tr("notetaker.speaker.rename_prompt", self._lang),
-                text=speaker.display_name,
-            )
+            dlg = QInputDialog(self)
+            dlg.setWindowTitle(tr("notetaker.speaker.rename", self._lang))
+            dlg.setLabelText(tr("notetaker.speaker.rename_prompt", self._lang))
+            dlg.setTextValue(speaker.display_name)
+            dlg.setStyleSheet(build_dialog_stylesheet(self._theme))
+            apply_windows_titlebar_theme(dlg, self._theme)
+            ok = dlg.exec() == int(QInputDialog.DialogCode.Accepted)
+            new_name = dlg.textValue()
             if ok and new_name.strip():
                 self._storage.rename_speaker(self._current_meeting_id, speaker.speaker_key, new_name.strip())
                 self._render_speakers_bar()
@@ -1187,6 +1283,7 @@ class MeetingNoteWorkspace(QWidget):
         if not speakers:
             return
         menu = QMenu(self)
+        menu.setStyleSheet(build_menu_stylesheet(self._theme))
         actions = {menu.addAction(s.display_name): s for s in speakers}
         chosen = menu.exec(self.cursor().pos())
         if chosen in actions:
@@ -1211,7 +1308,12 @@ class MeetingNoteWorkspace(QWidget):
             return
         for item in items:
             label = f"{item.text} ({item.owner})" if item.owner else item.text
-            row = _ActionItemRow(label, checked=item.done)
+            row = _ActionItemRow(
+                label,
+                checked=item.done,
+                theme=self._theme,
+                check_style=self._check_style,
+            )
             row.toggled.connect(
                 lambda checked, item_id=item.id: self._on_action_toggled(item_id, checked)
             )
@@ -1248,7 +1350,7 @@ class MeetingNoteWorkspace(QWidget):
         # Card top timer & banner
         if is_live:
             elapsed = self._level_provider()[2] if self._level_provider is not None else 0.0
-            self._tr_meta_lbl.setText(f"🕒 {format_timestamp(elapsed)}")
+            self._tr_meta_lbl.setText(format_timestamp(elapsed))
         else:
             spk_count = max(1, len(speakers)) if utterances else len(speakers)
             spk_label = (
@@ -1257,7 +1359,7 @@ class MeetingNoteWorkspace(QWidget):
                 else tr("notetaker.speakers_count", self._lang, n=spk_count)
             )
             dur = meeting.duration_sec if meeting is not None else 0.0
-            self._tr_meta_lbl.setText(f"🕒 {spk_label} · {format_timestamp(dur)}")
+            self._tr_meta_lbl.setText(f"{spk_label} · {format_timestamp(dur)}")
         self._live_banner_row.setVisible(is_live and not self._live_banner_dismissed)
 
         filtered = [
@@ -1483,7 +1585,8 @@ class MeetingNoteWorkspace(QWidget):
         txt = "\n".join(f"[{format_timestamp(u.start_sec)}] {speakers.get(u.speaker_key, u.speaker_key)}: {u.text}" for u in utterances)
         if txt:
             QApplication.clipboard().setText(txt)
-            self._tr_copy_btn.setText("✓")
+            t = get_theme_tokens(self._theme)
+            self._tr_copy_btn.setIcon(render_icon("check", t["accent"], 14))
             self._copy_reset_timer.start()
 
     def _on_regen_clicked(self) -> None:
@@ -1595,7 +1698,13 @@ class MeetingNoteWorkspace(QWidget):
         if ok:
             self._refresh_diarization_banner()
         elif err:
-            QMessageBox.warning(self, tr("notetaker.title", self._lang), err)
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle(tr("notetaker.title", self._lang))
+            box.setText(err)
+            box.setStyleSheet(build_dialog_stylesheet(self._theme))
+            apply_windows_titlebar_theme(box, self._theme)
+            box.exec()
 
 
 class MeetingSideWindow(QWidget):
@@ -1612,16 +1721,11 @@ class MeetingSideWindow(QWidget):
         theme: ResolvedTheme = "dark",
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(
-            parent,
-            Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window,
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        super().__init__(parent)
         self._storage = storage
         self._lang: LanguageCode = normalize_language(lang)
         self._theme: ResolvedTheme = theme
         self._has_positioned = False
-        self._drag_offset: QPoint | None = None
 
         outer_lay = QVBoxLayout(self)
         outer_lay.setContentsMargins(0, 0, 0, 0)
@@ -1636,19 +1740,21 @@ class MeetingSideWindow(QWidget):
 
         # Custom draggable top bar
         self._topbar = QWidget()
-        self._topbar.setFixedHeight(46)
+        self._topbar.setFixedHeight(44)
         top_lay = QHBoxLayout(self._topbar)
-        top_lay.setContentsMargins(14, 8, 12, 4)
+        top_lay.setContentsMargins(14, 8, 10, 4)
         top_lay.setSpacing(6)
 
-        self._back_btn = QPushButton("‹")
+        self._back_btn = QPushButton()
         self._back_btn.setObjectName("WisprChromeBtn")
         self._back_btn.setFixedSize(28, 28)
+        self._back_btn.setIconSize(QSize(14, 14))
         self._back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self._more_btn = QPushButton("•••")
+        self._more_btn = QPushButton()
         self._more_btn.setObjectName("WisprChromeBtn")
         self._more_btn.setFixedSize(28, 28)
+        self._more_btn.setIconSize(QSize(14, 14))
         self._more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self._export_btn = QPushButton("Export")
@@ -1656,24 +1762,28 @@ class MeetingSideWindow(QWidget):
         self._export_btn.setFixedHeight(28)
         self._export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self._copy_md_btn = QPushButton("⧉")
+        self._copy_md_btn = QPushButton()
         self._copy_md_btn.setObjectName("WisprChromeBtn")
         self._copy_md_btn.setFixedSize(28, 28)
+        self._copy_md_btn.setIconSize(QSize(14, 14))
         self._copy_md_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self._min_btn = QPushButton("—")
-        self._min_btn.setObjectName("WisprChromeBtn")
-        self._min_btn.setFixedSize(26, 26)
+        self._min_btn = QPushButton()
+        self._min_btn.setObjectName("windowChromeBtn")
+        self._min_btn.setFixedSize(28, 28)
+        self._min_btn.setIconSize(QSize(14, 14))
         self._min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self._max_btn = QPushButton("□")
-        self._max_btn.setObjectName("WisprChromeBtn")
-        self._max_btn.setFixedSize(26, 26)
+        self._max_btn = QPushButton()
+        self._max_btn.setObjectName("windowChromeBtn")
+        self._max_btn.setFixedSize(28, 28)
+        self._max_btn.setIconSize(QSize(14, 14))
         self._max_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self._close_btn = QPushButton("✕")
-        self._close_btn.setObjectName("WisprChromeBtn")
-        self._close_btn.setFixedSize(26, 26)
+        self._close_btn = QPushButton()
+        self._close_btn.setObjectName("windowCloseBtn")
+        self._close_btn.setFixedSize(28, 28)
+        self._close_btn.setIconSize(QSize(14, 14))
         self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
         top_lay.addWidget(self._back_btn)
@@ -1681,6 +1791,7 @@ class MeetingSideWindow(QWidget):
         top_lay.addWidget(self._more_btn)
         top_lay.addWidget(self._export_btn)
         top_lay.addWidget(self._copy_md_btn)
+        top_lay.addSpacing(2)
         top_lay.addWidget(self._min_btn)
         top_lay.addWidget(self._max_btn)
         top_lay.addWidget(self._close_btn)
@@ -1704,7 +1815,7 @@ class MeetingSideWindow(QWidget):
         self._copy_md_reset_timer = QTimer(self)
         self._copy_md_reset_timer.setSingleShot(True)
         self._copy_md_reset_timer.setInterval(1200)
-        self._copy_md_reset_timer.timeout.connect(lambda: self._copy_md_btn.setText("⧉"))
+        self._copy_md_reset_timer.timeout.connect(self._reset_copy_md_icon)
 
         self._back_btn.clicked.connect(self.back_to_hub_requested.emit)
         self._more_btn.clicked.connect(self._on_more_clicked)
@@ -1714,40 +1825,88 @@ class MeetingSideWindow(QWidget):
         self._max_btn.clicked.connect(self._toggle_maximize)
         self._close_btn.clicked.connect(self.hide)
 
+        self._frameless_helper = FramelessWindowHelper(
+            self,
+            self._shell,
+            titlebar_height=46,
+            on_maximized_changed=self._on_maximized_changed,
+        )
+
         self.resize(500, 820)
         self.setMinimumSize(400, 560)
         self.set_theme(self._theme)
         self.retranslate(self._lang)
 
+    def _refresh_chrome_icons(self) -> None:
+        t = get_theme_tokens(self._theme)
+        fg = t["text_secondary"]
+        self._back_btn.setIcon(render_icon("back", fg, 14))
+        self._more_btn.setIcon(render_icon("more", fg, 14))
+        self._copy_md_btn.setIcon(render_icon("copy", fg, 14))
+        self._min_btn.setIcon(render_icon("minimize", fg, 14))
+        self._max_btn.setIcon(render_icon("restore" if self.isMaximized() else "maximize", fg, 14))
+        self._close_btn.setIcon(render_icon("close", fg, 14))
+
+    def _reset_copy_md_icon(self) -> None:
+        t = get_theme_tokens(self._theme)
+        self._copy_md_btn.setIcon(render_icon("copy", t["text_secondary"], 14))
+
+    def _on_maximized_changed(self, is_max: bool) -> None:
+        t = get_theme_tokens(self._theme)
+        self._max_btn.setIcon(render_icon("restore" if is_max else "maximize", t["text_secondary"], 14))
+
     def set_theme(self, theme: ResolvedTheme) -> None:
         self._theme = theme
-        is_light = theme == "light"
-        bg = "#ffffff" if is_light else "#161618"
-        border = "#d4d4d8" if is_light else "#2b2b30"
-        fg = "#18181b" if is_light else "#e4e4e7"
-        chrome_bg = "#f4f4f6" if is_light else "#232327"
-        chrome_hover = "#e4e4e7" if is_light else "#2f2f35"
+        t = get_theme_tokens(theme)
 
         self._shell.setStyleSheet(
             f"""
             QFrame#WisprSideShell {{
-                background-color: {bg};
-                border: 1px solid {border};
+                background-color: {t["shell_bg"]};
+                border: 1px solid {t["shell_border"]};
                 border-radius: 14px;
-                color: {fg};
+                color: {t["text"]};
+            }}
+            QFrame#WisprSideShell[windowMaximized="true"] {{
+                border: none;
+                border-radius: 0px;
             }}
             QPushButton#WisprChromeBtn {{
-                background-color: {chrome_bg};
-                border: 1px solid {border};
+                background-color: {t["chrome_bg"]};
+                border: 1px solid {t["shell_border"]};
                 border-radius: 7px;
-                color: {fg};
-                font-size: 12px;
+                color: {t["text"]};
             }}
             QPushButton#WisprChromeBtn:hover {{
-                background-color: {chrome_hover};
+                background-color: {t["chrome_hover"]};
+            }}
+            QPushButton#WisprPillBtn {{
+                background-color: {t["chip_bg"]};
+                border: 1px solid {t["chip_border"]};
+                border-radius: 8px;
+                color: {t["text_strong"]};
+                padding: 4px 10px;
+                font-size: 12px;
+            }}
+            QPushButton#WisprPillBtn:hover {{
+                background-color: {t["hover_bg"]};
+            }}
+            QPushButton#windowChromeBtn, QPushButton#windowCloseBtn {{
+                background-color: transparent;
+                border: none;
+                border-radius: 7px;
+                color: {t["text_secondary"]};
+            }}
+            QPushButton#windowChromeBtn:hover {{
+                background-color: {t["chrome_hover"]};
+            }}
+            QPushButton#windowCloseBtn:hover {{
+                background-color: {t["close_hover_bg"]};
+                color: {t["close_hover_fg"]};
             }}
             """
         )
+        self._refresh_chrome_icons()
         self.workspace.set_theme(theme)
 
     def retranslate(self, lang: str) -> None:
@@ -1774,6 +1933,7 @@ class MeetingSideWindow(QWidget):
         if not self._has_positioned:
             self.dock_right_side()
         self.showNormal()
+        self._frameless_helper.sync_maximized_state()
         self.raise_()
         self.activateWindow()
 
@@ -1781,32 +1941,12 @@ class MeetingSideWindow(QWidget):
         event.ignore()
         self.hide()
 
-    def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() == Qt.MouseButton.LeftButton and event.position().y() <= 46:
-            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-        if self._drag_offset is not None:
-            self._drag_offset = None
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
     def _toggle_maximize(self) -> None:
         if self.isMaximized():
             self.showNormal()
         else:
             self.showMaximized()
+        self._frameless_helper.sync_maximized_state()
 
     def _on_export_clicked(self) -> None:
         mid = self.workspace.current_meeting_id
@@ -1837,7 +1977,8 @@ class MeetingSideWindow(QWidget):
         md = self._storage.export_markdown(mid)
         if md:
             QApplication.clipboard().setText(md)
-            self._copy_md_btn.setText("✓")
+            t = get_theme_tokens(self._theme)
+            self._copy_md_btn.setIcon(render_icon("check", t["accent"], 14))
             self._copy_md_reset_timer.start()
 
     def _on_more_clicked(self) -> None:
@@ -1845,6 +1986,7 @@ class MeetingSideWindow(QWidget):
         if mid is None:
             return
         menu = QMenu(self)
+        menu.setStyleSheet(build_menu_stylesheet(self._theme))
         regen_act = menu.addAction(tr("notetaker.btn.regenerate", self._lang))
         force_act = menu.addAction(tr("notetaker.summary.force", self._lang))
         menu.addSeparator()
@@ -1860,3 +2002,190 @@ class MeetingSideWindow(QWidget):
             self._storage.delete_meeting(mid, hard=False)
             self.workspace.delete_meeting_requested.emit(mid)
             self.hide()
+
+
+class ShortMeetingModal(QDialog):
+    """Wispr Flow-style 'Started by mistake?' floating modal for ultra-short/empty meetings."""
+
+    def __init__(
+        self,
+        *,
+        lang: LanguageCode = DEFAULT_LANGUAGE,
+        theme: ResolvedTheme = "dark",
+        anchor_widget: QWidget | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(
+            parent,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Dialog,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setModal(True)
+        self._lang: LanguageCode = normalize_language(lang)
+        self._theme: ResolvedTheme = theme
+        self.choice: str = "keep"
+
+        self.setFixedWidth(400)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self._card = QFrame()
+        self._card.setObjectName("ShortMeetingCard")
+        outer.addWidget(self._card)
+
+        card_lay = QVBoxLayout(self._card)
+        card_lay.setContentsMargins(20, 18, 20, 18)
+        card_lay.setSpacing(12)
+
+        # Header row: warning icon + title + circular close button
+        hdr = QHBoxLayout()
+        hdr.setSpacing(10)
+
+        self._warn_lbl = QLabel()
+        self._warn_lbl.setFixedSize(20, 20)
+        hdr.addWidget(self._warn_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._title_lbl = QLabel(tr("notetaker.short_modal.title", self._lang))
+        self._title_lbl.setObjectName("ShortModalTitle")
+        hdr.addWidget(self._title_lbl, 1)
+
+        self._close_btn = QPushButton()
+        self._close_btn.setObjectName("ShortModalClose")
+        self._close_btn.setFixedSize(28, 28)
+        self._close_btn.setIconSize(QSize(12, 12))
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._close_btn.clicked.connect(self.reject)
+        hdr.addWidget(self._close_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        card_lay.addLayout(hdr)
+
+        # Body message
+        self._body_lbl = QLabel(tr("notetaker.short_modal.body", self._lang))
+        self._body_lbl.setObjectName("ShortModalBody")
+        self._body_lbl.setWordWrap(True)
+        card_lay.addWidget(self._body_lbl)
+
+        # Action buttons row
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 4, 0, 0)
+        btn_row.setSpacing(8)
+        btn_row.addStretch(1)
+
+        self._discard_btn = QPushButton(tr("notetaker.short_modal.discard", self._lang))
+        self._discard_btn.setObjectName("ShortModalDiscard")
+        self._discard_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._discard_btn.clicked.connect(self._on_discard)
+
+        self._keep_btn = QPushButton(tr("notetaker.short_modal.keep", self._lang))
+        self._keep_btn.setObjectName("ShortModalKeep")
+        self._keep_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._keep_btn.clicked.connect(self._on_keep)
+        self._keep_btn.setDefault(True)
+
+        btn_row.addWidget(self._discard_btn)
+        btn_row.addWidget(self._keep_btn)
+        card_lay.addLayout(btn_row)
+
+        self._apply_styles()
+        self.adjustSize()
+        self._position_near(anchor_widget)
+
+    def _on_discard(self) -> None:
+        self.choice = "discard"
+        self.accept()
+
+    def _on_keep(self) -> None:
+        self.choice = "keep"
+        self.accept()
+
+    def _apply_styles(self) -> None:
+        is_light = self._theme == "light"
+        bg = "#ffffff" if is_light else "#0c0c0e"
+        border = "#d4d4d8" if is_light else "#26262b"
+        title_fg = "#111113" if is_light else "#fafafa"
+        body_fg = "#52525b" if is_light else "#a1a1aa"
+        close_bg = "#f4f4f6" if is_light else "#141417"
+        close_border = "#d4d4d8" if is_light else "#303036"
+        close_hover = "#e4e4e7" if is_light else "#25252b"
+        discard_bg = "#f4f4f6" if is_light else "#1d1d21"
+        discard_hover = "#e4e4e7" if is_light else "#2a2a30"
+        discard_fg = "#18181b" if is_light else "#fafafa"
+        keep_bg = "#18181b" if is_light else "#efeee9"
+        keep_hover = "#27272a" if is_light else "#ffffff"
+        keep_fg = "#ffffff" if is_light else "#111113"
+
+        self._warn_lbl.setPixmap(render_icon("warning", "#d97706" if is_light else "#f5c542", 20).pixmap(20, 20))
+        self._close_btn.setIcon(render_icon("close", title_fg, 12))
+
+        self._card.setStyleSheet(
+            f"""
+            QFrame#ShortMeetingCard {{
+                background-color: {bg};
+                border: 1px solid {border};
+                border-radius: 18px;
+            }}
+            QLabel#ShortModalTitle {{
+                color: {title_fg};
+                font-size: 14.5px;
+                font-weight: 700;
+                background: transparent;
+                border: none;
+            }}
+            QLabel#ShortModalBody {{
+                color: {body_fg};
+                font-size: 13px;
+                line-height: 1.4;
+                background: transparent;
+                border: none;
+            }}
+            QPushButton#ShortModalClose {{
+                background-color: {close_bg};
+                border: 1px solid {close_border};
+                border-radius: 14px;
+            }}
+            QPushButton#ShortModalClose:hover {{
+                background-color: {close_hover};
+            }}
+            QPushButton#ShortModalDiscard {{
+                background-color: {discard_bg};
+                color: {discard_fg};
+                border: none;
+                border-radius: 10px;
+                padding: 8px 18px;
+                font-size: 12.5px;
+                font-weight: 600;
+            }}
+            QPushButton#ShortModalDiscard:hover {{
+                background-color: {discard_hover};
+            }}
+            QPushButton#ShortModalKeep {{
+                background-color: {keep_bg};
+                color: {keep_fg};
+                border: none;
+                border-radius: 10px;
+                padding: 8px 18px;
+                font-size: 12.5px;
+                font-weight: 600;
+            }}
+            QPushButton#ShortModalKeep:hover {{
+                background-color: {keep_hover};
+            }}
+            """
+        )
+
+    def _position_near(self, anchor: QWidget | None) -> None:
+        sz = self.sizeHint()
+        w = max(self.width(), sz.width())
+        h = max(self.height(), sz.height())
+        screen = (
+            QGuiApplication.screenAt(anchor.frameGeometry().center())
+            if anchor is not None and anchor.isVisible()
+            else None
+        ) or QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            x = avail.x() + (avail.width() - w) // 2
+            y = avail.y() + avail.height() - h - 68
+            self.move(x, y)

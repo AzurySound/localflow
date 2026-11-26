@@ -7,7 +7,7 @@ import difflib
 import html
 import threading
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from localflow import __version__
 from localflow.audio.recorder import list_input_devices
 from localflow.audio.sound_fx import play_cue
 from localflow.config import (
@@ -88,15 +89,19 @@ from localflow.styles import (
     parse_app_style_overrides,
 )
 from localflow.vocabulary import parse_vocabulary
+from localflow.ui.icons import render_icon
 from localflow.ui.insights_page import InsightsPage
 from localflow.ui.theme import (
     ResolvedTheme,
     apply_windows_titlebar_theme,
+    build_dialog_stylesheet,
     build_hub_stylesheet,
     build_menu_stylesheet,
     get_theme_choice_items,
+    get_theme_tokens,
     resolve_theme,
 )
+from localflow.ui.widgets import CheckmarkProxyStyle, DropdownCombo, FramelessWindowHelper
 
 STYLE_CATEGORY_ROWS: tuple[tuple[str, str], ...] = (
     ("messenger", "style.cat.messenger"),
@@ -146,39 +151,7 @@ def _build_window_icon() -> QIcon:
     return QIcon(pix)
 
 
-class _DropdownCombo(QComboBox):
-    """QComboBox with a crisp anti-aliased vector chevron indicator and disabled wheel scrolling."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-
-    def wheelEvent(self, event) -> None:  # type: ignore[override]
-        # Let wheel events bubble up to the parent QScrollArea instead of changing combo selection
-        event.ignore()
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        is_light = getattr(self.window(), "_resolved_theme", "dark") == "light"
-        if is_light:
-            color = QColor("#52525b") if self.isEnabled() else QColor("#a1a1aa")
-        else:
-            color = QColor("#a1a1aa") if self.isEnabled() else QColor("#3f3f46")
-        p.setPen(
-            QPen(
-                color,
-                1.5,
-                Qt.PenStyle.SolidLine,
-                Qt.PenCapStyle.RoundCap,
-                Qt.PenJoinStyle.RoundJoin,
-            )
-        )
-        cx = float(self.width()) - 14.0
-        cy = float(self.height()) / 2.0 + 1.0
-        p.drawLine(QPointF(cx - 3.6, cy - 2.2), QPointF(cx, cy + 1.6))
-        p.drawLine(QPointF(cx, cy + 1.6), QPointF(cx + 3.6, cy - 2.2))
+_DropdownCombo = DropdownCombo
 
 
 class _NoWheelSpinBox(QSpinBox):
@@ -269,6 +242,8 @@ class SettingsWindow(QWidget):
         self._download_active = False
         self._download_label_short = ""
         self._active_dl_dest: Path | None = None
+        self._check_style = CheckmarkProxyStyle(self._resolved_theme)
+        self._nav_items: list[tuple[QPushButton, str]] = []
         self._models_loaded.connect(self._on_models_loaded)
         self._models_failed.connect(self._on_models_failed)
         self._download_progress.connect(self._on_download_progress)
@@ -279,11 +254,65 @@ class SettingsWindow(QWidget):
 
         self.setWindowTitle(tr("window.title", self._lang))
         self.setWindowIcon(_build_window_icon())
-        self.resize(960, 630)
-        self.setMinimumSize(680, 340)
+        self.resize(980, 660)
+        self.setMinimumSize(680, 380)
 
-        root = QHBoxLayout(self)
-        root.setContentsMargins(10, 10, 10, 10)
+        outer_root = QVBoxLayout(self)
+        outer_root.setContentsMargins(0, 0, 0, 0)
+        outer_root.setSpacing(0)
+
+        self._shell = QFrame()
+        self._shell.setObjectName("appShell")
+        outer_root.addWidget(self._shell)
+
+        shell_vbox = QVBoxLayout(self._shell)
+        shell_vbox.setContentsMargins(0, 0, 0, 0)
+        shell_vbox.setSpacing(0)
+
+        # Embedded frameless window title bar matching MeetingSideWindow
+        self._topbar = QFrame()
+        self._topbar.setObjectName("topTitleBar")
+        self._topbar.setFixedHeight(38)
+        top_lay = QHBoxLayout(self._topbar)
+        top_lay.setContentsMargins(16, 6, 10, 0)
+        top_lay.setSpacing(8)
+
+        self._logo_glyph = _FlowLogoGlyph()
+        top_lay.addWidget(self._logo_glyph)
+        brand_title = QLabel("LocalFlow")
+        brand_title.setObjectName("brandTitle")
+        top_lay.addWidget(brand_title)
+        version_badge = QLabel(f"v{__version__}")
+        version_badge.setObjectName("windowVersionBadge")
+        top_lay.addWidget(version_badge)
+        top_lay.addStretch(1)
+
+        self._min_btn = QPushButton()
+        self._min_btn.setObjectName("windowChromeBtn")
+        self._min_btn.setFixedSize(28, 28)
+        self._min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._min_btn.clicked.connect(self.showMinimized)
+
+        self._max_btn = QPushButton()
+        self._max_btn.setObjectName("windowChromeBtn")
+        self._max_btn.setFixedSize(28, 28)
+        self._max_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._max_btn.clicked.connect(self._toggle_maximize)
+
+        self._close_btn = QPushButton()
+        self._close_btn.setObjectName("windowCloseBtn")
+        self._close_btn.setFixedSize(28, 28)
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._close_btn.clicked.connect(self.close)
+
+        top_lay.addWidget(self._min_btn)
+        top_lay.addWidget(self._max_btn)
+        top_lay.addWidget(self._close_btn)
+        shell_vbox.addWidget(self._topbar)
+
+        body_wrap = QWidget()
+        root = QHBoxLayout(body_wrap)
+        root.setContentsMargins(10, 6, 10, 10)
         root.setSpacing(10)
 
         self._sidebar = self._build_sidebar()
@@ -321,8 +350,17 @@ class SettingsWindow(QWidget):
         canvas_layout.addWidget(self._config_footer)
 
         root.addWidget(canvas, stretch=1)
+        shell_vbox.addWidget(body_wrap, stretch=1)
+
+        self._frameless_helper = FramelessWindowHelper(
+            self,
+            self._shell,
+            titlebar_height=42,
+            on_maximized_changed=self._on_maximized_changed,
+        )
         self.apply_theme(self._config.theme)
         self.apply_language(self._config.language)
+        self._install_checkbox_styles()
 
     def _bind_text(self, widget: QWidget, key: str) -> None:
         self._i18n_texts.append((widget, key))
@@ -351,22 +389,50 @@ class SettingsWindow(QWidget):
             combo.setCurrentIndex(idx)
         combo.blockSignals(False)
 
+    def _install_checkbox_styles(self) -> None:
+        for cb in self.findChildren(QCheckBox):
+            cb.setStyle(self._check_style)
+
+    def _toggle_maximize(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        self._frameless_helper.sync_maximized_state()
+
+    def _on_maximized_changed(self, is_max: bool) -> None:
+        t = get_theme_tokens(self._resolved_theme)
+        self._max_btn.setIcon(render_icon("restore" if is_max else "maximize", t["text_secondary"], 14))
+
+    def _refresh_chrome_and_nav_icons(self) -> None:
+        t = get_theme_tokens(self._resolved_theme)
+        chrome_color = t["text_secondary"]
+        self._min_btn.setIcon(render_icon("minimize", chrome_color, 14))
+        self._max_btn.setIcon(
+            render_icon("restore" if self.isMaximized() else "maximize", chrome_color, 14)
+        )
+        self._close_btn.setIcon(render_icon("close", chrome_color, 14))
+        for btn, icon_name in self._nav_items:
+            col = t["nav_active_fg"] if btn.isChecked() else t["nav_fg"]
+            btn.setIcon(render_icon(icon_name, col, 16))
+
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
-        apply_windows_titlebar_theme(self, self._resolved_theme)
+        self._frameless_helper.sync_maximized_state()
 
     def apply_theme(self, theme_mode: str | None = None) -> ResolvedTheme:
         resolved = resolve_theme(theme_mode if theme_mode is not None else self._config.theme)
         self._resolved_theme = resolved
+        self._check_style.set_theme(resolved)
         self.setStyleSheet(build_hub_stylesheet(resolved))
         self._logo_glyph.set_theme(resolved)
         self._notetaker_tab.set_theme(resolved)
         self._insights_tab.set_theme(resolved)
         self._update_status_card(self._config)
+        self._refresh_chrome_and_nav_icons()
         for combo in self.findChildren(_DropdownCombo):
             combo.update()
-        if self.isVisible():
-            apply_windows_titlebar_theme(self, resolved)
+        self._install_checkbox_styles()
         return resolved
 
     def apply_language(self, lang: str | None = None) -> LanguageCode:
@@ -439,31 +505,19 @@ class SettingsWindow(QWidget):
         sb.setObjectName("sidebar")
         sb.setFixedWidth(212)
         layout = QVBoxLayout(sb)
-        layout.setContentsMargins(6, 10, 6, 6)
+        layout.setContentsMargins(6, 4, 6, 6)
         layout.setSpacing(4)
-
-        # Clean brand header (matching "|||| Flow" in Wispr Flow)
-        brand_row = QHBoxLayout()
-        brand_row.setContentsMargins(10, 2, 6, 16)
-        brand_row.setSpacing(9)
-        self._logo_glyph = _FlowLogoGlyph()
-        brand_row.addWidget(self._logo_glyph)
-        brand_title = QLabel("LocalFlow")
-        brand_title.setObjectName("brandTitle")
-        brand_row.addWidget(brand_title)
-        brand_row.addStretch()
-        layout.addLayout(brand_row)
 
         # Navigation buttons
         self._nav_group = QButtonGroup(self)
         self._nav_group.setExclusive(True)
 
-        self._nav_history = self._make_nav_button(tr("nav.history", self._lang), checked=True)
-        self._nav_notetaker = self._make_nav_button(tr("nav.notetaker", self._lang))
-        self._nav_insights = self._make_nav_button(tr("nav.insights", self._lang))
-        self._nav_vocab = self._make_nav_button(tr("nav.vocab", self._lang))
-        self._nav_style = self._make_nav_button(tr("nav.style", self._lang))
-        self._nav_settings = self._make_nav_button(tr("nav.settings", self._lang))
+        self._nav_history = self._make_nav_button(tr("nav.history", self._lang), checked=True, icon_name="history")
+        self._nav_notetaker = self._make_nav_button(tr("nav.notetaker", self._lang), icon_name="notetaker")
+        self._nav_insights = self._make_nav_button(tr("nav.insights", self._lang), icon_name="insights")
+        self._nav_vocab = self._make_nav_button(tr("nav.vocab", self._lang), icon_name="dictionary")
+        self._nav_style = self._make_nav_button(tr("nav.style", self._lang), icon_name="style")
+        self._nav_settings = self._make_nav_button(tr("nav.settings", self._lang), icon_name="settings")
         self._bind_text(self._nav_history, "nav.history")
         self._bind_text(self._nav_notetaker, "nav.notetaker")
         self._bind_text(self._nav_insights, "nav.insights")
@@ -547,12 +601,20 @@ class SettingsWindow(QWidget):
         layout.addWidget(self._hotkeys_card)
         return sb
 
-    def _make_nav_button(self, text: str, *, checked: bool = False) -> QPushButton:
+    def _make_nav_button(
+        self,
+        text: str,
+        *,
+        checked: bool = False,
+        icon_name: str = "history",
+    ) -> QPushButton:
         btn = QPushButton(text)
         btn.setObjectName("navBtn")
         btn.setCheckable(True)
         btn.setChecked(checked)
+        btn.setIconSize(QSize(16, 16))
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._nav_items.append((btn, icon_name))
         return btn
 
     def _navigate_to(self, target: str) -> None:
@@ -581,6 +643,17 @@ class SettingsWindow(QWidget):
         self.raise_()
         self.activateWindow()
 
+    def show_history(self) -> None:
+        self.refresh_history()
+        self._navigate_to("history")
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def show_settings(self) -> None:
+        self._navigate_to("settings")
+        self.show_and_focus()
+
     def _sync_sidebar_for_stack_index(self, index: int) -> None:
         w = self._tabs.widget(index)
         if w is self._history_tab:
@@ -598,6 +671,7 @@ class SettingsWindow(QWidget):
         self._config_footer.setVisible(
             w in (self._vocab_tab, self._style_tab, self._settings_tab)
         )
+        self._refresh_chrome_and_nav_icons()
 
     def refresh_insights(self) -> None:
         self._insights_tab.refresh(self._storage.list_all(include_deleted=True))
@@ -1192,7 +1266,13 @@ class SettingsWindow(QWidget):
     def _on_rerun_cleanup_failed(self, _entry_id: int, err: str) -> None:
         self._rerun_cleanup_btn.setText(tr("history.rerun_cleanup", self._lang))
         self._rerun_cleanup_btn.setEnabled(True)
-        QMessageBox.warning(self, tr("history.rerun_cleanup", self._lang), err)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(tr("history.rerun_cleanup", self._lang))
+        box.setText(err)
+        box.setStyleSheet(build_dialog_stylesheet(self._resolved_theme))
+        apply_windows_titlebar_theme(box, self._resolved_theme)
+        box.exec()
 
     def _on_history_context_menu(self, pos) -> None:
         item = self._history_list.itemAt(pos)
@@ -1238,7 +1318,7 @@ class SettingsWindow(QWidget):
         confirm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         box.setDefaultButton(cancel_btn)
         box.setEscapeButton(cancel_btn)
-        box.setStyleSheet(build_hub_stylesheet(self._resolved_theme))
+        box.setStyleSheet(build_dialog_stylesheet(self._resolved_theme))
         apply_windows_titlebar_theme(box, self._resolved_theme)
         box.exec()
         return box.clickedButton() is confirm_btn

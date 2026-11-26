@@ -787,3 +787,66 @@ def test_warming_pill_queues_autostart_and_cancels_on_esc(make_harness, qtbot) -
     qtbot.waitUntil(lambda: ctrl._state == AppState.RECORDING, timeout=3000)
     assert ctrl._start_recording_when_ready is False
 
+
+def test_short_meeting_accidental_modal_discard_and_keep(make_harness, monkeypatch) -> None:
+    ctrl, _ = make_harness(AppConfig(llm_enabled=False, ollama_warmup_on_start=False))
+
+    m_short = ctrl._meeting_storage.create_meeting(title="Accidental", audio_mode="dual", status="recording")
+    ctrl._meeting_storage.add_utterance(
+        m_short.id, speaker_key="you", channel="mic", start_sec=0.5, end_sec=2.0, text="hello test"
+    )
+    ctrl._meeting_storage.update_meeting(m_short.id, duration_sec=3.0)
+    assert ctrl._is_meeting_accidental(m_short.id) is True
+
+    m_full = ctrl._meeting_storage.create_meeting(title="Real Sync", audio_mode="dual", status="recording")
+    ctrl._meeting_storage.add_utterance(
+        m_full.id,
+        speaker_key="you",
+        channel="mic",
+        start_sec=0.5,
+        end_sec=45.0,
+        text=" ".join(f"word{i}" for i in range(30)),
+    )
+    ctrl._meeting_storage.update_meeting(m_full.id, duration_sec=60.0)
+    assert ctrl._is_meeting_accidental(m_full.id) is False
+
+    # User chooses Discard -> meeting removed hard from storage
+    monkeypatch.setattr(ctrl, "_confirm_short_meeting", lambda mid: "discard")
+    ctrl._on_meeting_stopped_ui(m_short.id)
+    assert ctrl._meeting_storage.get_meeting(m_short.id) is None
+
+    # Second short meeting where user chooses Keep -> meeting preserved
+    m_keep = ctrl._meeting_storage.create_meeting(title="Keep Brief", audio_mode="dual", status="recording")
+    ctrl._meeting_storage.add_utterance(
+        m_keep.id, speaker_key="you", channel="mic", start_sec=0.5, end_sec=2.0, text="just two words"
+    )
+    ctrl._meeting_storage.update_meeting(m_keep.id, duration_sec=4.0)
+    monkeypatch.setattr(ctrl, "_confirm_short_meeting", lambda mid: "keep")
+    ctrl._on_meeting_stopped_ui(m_keep.id)
+    assert ctrl._meeting_storage.get_meeting(m_keep.id) is not None
+
+
+def test_paste_last_dictation_and_show_settings_always_opens_settings_tab(
+    make_harness, qtbot
+) -> None:
+    ctrl, h = make_harness(AppConfig(llm_enabled=False, ollama_warmup_on_start=False))
+
+    # Switching away from Settings to Notetaker, then calling show_settings() opens Settings tab
+    ctrl._settings.show_notetaker()
+    assert ctrl._settings._tabs.currentWidget() is ctrl._settings._notetaker_tab
+    ctrl._settings.show_settings()
+    assert ctrl._settings._tabs.currentWidget() is ctrl._settings._settings_tab
+
+    # _on_paste_last_dictation copies text to clipboard AND injects it into active field
+    ctrl._last_dictation_text = "готовый текст для вставки"
+    ctrl._last_external_hwnd = None
+    ctrl._on_paste_last_dictation()
+    assert h.clipboard.text() == "готовый текст для вставки"
+    qtbot.waitUntil(lambda: len(ctrl._injector.inject_calls) == 1, timeout=3000)
+    call = ctrl._injector.inject_calls[0]
+    assert call["text"] == "готовый текст для вставки"
+    assert call["auto_space"] is False
+    assert call["restore_clipboard"] is False
+
+
+

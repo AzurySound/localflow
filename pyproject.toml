@@ -1,6 +1,6 @@
 [project]
 name = "localflow"
-version = "0.3.0"
+version = "0.3.1"
 description = "Standalone local Wispr Flow alternative for Windows (PySide6 + faster-whisper + embedded llama.cpp / Ollama)"
 readme = "README.md"
 license = "MIT"

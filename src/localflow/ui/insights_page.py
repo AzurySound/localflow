@@ -462,10 +462,12 @@ class InsightsPage(QWidget):
 
     def set_theme(self, theme: ResolvedTheme) -> None:
         self._resolved_theme = theme
-        is_light = theme == "light"
-        strong = "#111113" if is_light else "#fafafa"
-        body = "#3f3f46" if is_light else "#d4d4d8"
-        desk = "#18181b" if is_light else "#e4e4e7"
+        from localflow.ui.theme import get_theme_tokens
+
+        t = get_theme_tokens(theme)
+        strong = t["text_strong"]
+        body = t["text_secondary"]
+        desk = t["text"]
 
         kpi_css = f"color:{strong}; font-size:20pt; font-weight:700;"
         self._wpm_val.setStyleSheet(kpi_css)
@@ -477,16 +479,11 @@ class InsightsPage(QWidget):
         self._dict_fixes_lbl.setStyleSheet(sub_css)
 
         self._desk_lbl.setStyleSheet(f"color:{desk}; font-weight:600; font-size:9pt;")
-        if is_light:
-            self._time_saved_badge.setStyleSheet(
-                "background-color:#ffffff; color:#27272a; border:1px solid #d4d4dc; "
-                "border-radius:7px; padding:5px 10px; font-size:8.5pt; font-weight:600;"
-            )
-        else:
-            self._time_saved_badge.setStyleSheet(
-                "background-color:#151517; color:#d4d4d8; border:1px solid #2e2e34; "
-                "border-radius:7px; padding:5px 10px; font-size:8.5pt; font-weight:600;"
-            )
+        self._time_saved_badge.setStyleSheet(
+            f"background-color:{t['status_bg']}; color:{t['text_secondary']}; "
+            f"border:1px solid {t['status_border']}; border-radius:7px; padding:5px 10px; "
+            "font-size:8.5pt; font-weight:600;"
+        )
 
         card_title_css = f"color:{strong}; font-size:13pt; font-weight:700;"
         self._usage_title.setStyleSheet(card_title_css)

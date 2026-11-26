@@ -427,3 +427,26 @@ def test_config_saved_signal_and_status_message(make_settings, qtbot) -> None:
     assert emitted.live_preview_enabled is False
     assert emitted.silence_auto_stop_enabled is True
     assert emitted.silence_auto_stop_sec == pytest.approx(3.5)
+
+
+def test_frameless_embedded_header_and_sidebar_vector_icons(make_settings, qtbot) -> None:
+    from PySide6.QtCore import Qt
+
+    win = make_settings(AppConfig(theme="dark"))
+    assert bool(win.windowFlags() & Qt.WindowType.FramelessWindowHint)
+    assert win._shell.objectName() == "appShell"
+    assert not win._min_btn.icon().isNull()
+    assert not win._max_btn.icon().isNull()
+    assert not win._close_btn.icon().isNull()
+    for btn, _name in win._nav_items:
+        assert not btn.icon().isNull()
+
+    win.show()
+    qtbot.waitUntil(win.isVisible, timeout=2000)
+    win._toggle_maximize()
+    assert win.isMaximized()
+    assert win._shell.property("windowMaximized") is True
+    win._toggle_maximize()
+    assert not win.isMaximized()
+    assert win._shell.property("windowMaximized") is False
+

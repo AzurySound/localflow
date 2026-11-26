@@ -7,7 +7,7 @@ import math
 from enum import Enum
 from typing import Callable
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QCursor,
@@ -39,8 +39,115 @@ IDLE_HITBOX_WIDTH = 68
 IDLE_HITBOX_HEIGHT = 14
 IDLE_BAR_WIDTH = 54
 IDLE_BAR_HEIGHT = 7
-HOVER_WIDTH = 84
+HOVER_WIDTH = 86
+HOVER_RIGHT_EXTRA = 32
 DRAG_THRESHOLD_PX = 4
+
+
+class _PillTooltipPopup(QWidget):
+    """Floating non-activating obsidian/light capsule tooltip shown above the Flow Bar."""
+
+    HEIGHT = 30
+
+    def __init__(self) -> None:
+        super().__init__(
+            None,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.WindowTransparentForInput,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._text = ""
+        self._bold_suffix = ""
+        self._theme: ResolvedTheme = "dark"
+        self._font_reg = QFont("Segoe UI", 9, QFont.Weight.Normal)
+        self._font_bold = QFont("Segoe UI", 9, QFont.Weight.Bold)
+        self._fm_reg = QFontMetrics(self._font_reg)
+        self._fm_bold = QFontMetrics(self._font_bold)
+
+    def show_above(
+        self,
+        anchor_rect: QRect,
+        text: str,
+        bold_suffix: str = "",
+        theme: ResolvedTheme = "dark",
+    ) -> None:
+        self._text = text.strip()
+        self._bold_suffix = bold_suffix.strip()
+        self._theme = theme
+        if not self._text:
+            self.hide()
+            return
+
+        reg_w = self._fm_reg.horizontalAdvance(self._text)
+        bold_w = (
+            self._fm_reg.horizontalAdvance(" ") + self._fm_bold.horizontalAdvance(self._bold_suffix)
+            if self._bold_suffix
+            else 0
+        )
+        w = max(72, reg_w + bold_w + 26)
+        h = self.HEIGHT
+        self.setFixedSize(w, h)
+
+        x = anchor_rect.center().x() - w // 2
+        y = anchor_rect.top() - h - 8
+        screen = QGuiApplication.screenAt(anchor_rect.center()) or QGuiApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.availableGeometry()
+            x = max(geo.x() + 4, min(x, geo.x() + geo.width() - w - 4))
+            y = max(geo.y() + 4, y)
+        self.move(x, y)
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            rect = QRectF(0.75, 0.75, float(self.width()) - 1.5, float(self.height()) - 1.5)
+            radius = rect.height() / 2.0
+            path = QPainterPath()
+            path.addRoundedRect(rect, radius, radius)
+
+            is_light = self._theme == "light"
+            bg = QColor(255, 255, 255, 248) if is_light else QColor(12, 12, 15, 245)
+            border = QColor(24, 24, 27, 45) if is_light else QColor(255, 255, 255, 42)
+            fg_reg = QColor(39, 39, 42) if is_light else QColor(228, 228, 231)
+            fg_bold = QColor(17, 17, 19) if is_light else QColor(250, 250, 250)
+
+            p.fillPath(path, bg)
+            p.setPen(QPen(border, 1.0))
+            p.drawPath(path)
+
+            reg_w = self._fm_reg.horizontalAdvance(self._text)
+            space_w = self._fm_reg.horizontalAdvance(" ") if self._bold_suffix else 0
+            bold_w = self._fm_bold.horizontalAdvance(self._bold_suffix) if self._bold_suffix else 0
+            total_w = reg_w + space_w + bold_w
+            start_x = (float(self.width()) - total_w) / 2.0
+
+            p.setFont(self._font_reg)
+            p.setPen(fg_reg)
+            p.drawText(
+                QRectF(start_x, 0.0, float(reg_w) + 2.0, float(self.height())),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                self._text,
+            )
+            if self._bold_suffix:
+                p.setFont(self._font_bold)
+                p.setPen(fg_bold)
+                p.drawText(
+                    QRectF(start_x + reg_w + space_w, 0.0, float(bold_w) + 2.0, float(self.height())),
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                    self._bold_suffix,
+                )
+        finally:
+            p.end()
 
 
 class PillMode(str, Enum):
@@ -106,11 +213,13 @@ class FloatingPillWidget(QWidget):
         # Hover expansion state for IDLE_BAR
         self._hovered = False
         self._hover_progress = 0.0
+        self._right_expand_progress = 0.0
         self._context_menu_open = False
         self._cancel_hovered = False
-        self._copy_hovered = False
+        self._idle_hover_zone = ""  # "mic" | "notetaker" | "menu" | ""
         self._has_last_dictation = True
         self._resolved_theme: ResolvedTheme = "dark"
+        self._tooltip_popup = _PillTooltipPopup()
 
         # Custom user position (saved across sessions; always anchored to COMPACT_WIDTH x PILL_HEIGHT)
         self._saved_pos: QPoint | None = (
@@ -121,7 +230,7 @@ class FloatingPillWidget(QWidget):
         self._did_drag = False
 
         self._anim_timer = QTimer(self)
-        self._anim_timer.setInterval(25)  # 40 FPS for snappy voice & hover animation
+        self._anim_timer.setInterval(16)  # ~60 FPS for crisp fluid hover & waveform animation
         self._anim_timer.timeout.connect(self._on_tick)
 
         self._hide_timer = QTimer(self)
@@ -130,8 +239,14 @@ class FloatingPillWidget(QWidget):
 
         self._leave_timer = QTimer(self)
         self._leave_timer.setSingleShot(True)
-        self._leave_timer.setInterval(180)
+        self._leave_timer.setInterval(260)
         self._leave_timer.timeout.connect(self._collapse_idle_hover)
+
+        # Fallback hover watcher: Windows TrackMouseEvent(TME_LEAVE) is one-shot, so
+        # swallowing a premature leaveEvent (e.g. grazing top/right edge) disarms OS leave events.
+        self._hover_watch_timer = QTimer(self)
+        self._hover_watch_timer.setInterval(80)
+        self._hover_watch_timer.timeout.connect(self._check_idle_hover_cursor)
 
         self._font_label = QFont("Segoe UI", 8, QFont.Weight.Medium)
         self._font_metrics = QFontMetrics(self._font_label)
@@ -176,10 +291,17 @@ class FloatingPillWidget(QWidget):
         return (PREVIEW_HEIGHT + PREVIEW_GAP) if self._has_preview() else 0
 
     def _idle_dimensions(self) -> tuple[int, int]:
-        t = 1.0 - (1.0 - self._hover_progress) ** 2
-        w = round(IDLE_HITBOX_WIDTH + (HOVER_WIDTH - IDLE_HITBOX_WIDTH) * t)
-        h = round(IDLE_HITBOX_HEIGHT + (PILL_HEIGHT - IDLE_HITBOX_HEIGHT) * t)
+        base_w, _extra, w, h = self._idle_layout_metrics()
+        _ = base_w
         return w, h
+
+    def _idle_layout_metrics(self) -> tuple[int, int, int, int]:
+        t = 1.0 - (1.0 - self._hover_progress) ** 3
+        r = 1.0 - (1.0 - self._right_expand_progress) ** 3
+        base_w = round(IDLE_HITBOX_WIDTH + (HOVER_WIDTH - IDLE_HITBOX_WIDTH) * t)
+        extra_w = round(HOVER_RIGHT_EXTRA * r)
+        h = round(IDLE_HITBOX_HEIGHT + (PILL_HEIGHT - IDLE_HITBOX_HEIGHT) * t)
+        return base_w, extra_w, base_w + extra_w, h
 
     def _target_width_for_mode(self) -> int:
         if self._mode == PillMode.IDLE_BAR:
@@ -205,19 +327,70 @@ class FloatingPillWidget(QWidget):
         pill_y = float(self._top_offset())
         return QRectF(pill_x + 4.0, pill_y + 4.0, 24.0, 24.0)
 
-    def _copy_button_rect(self) -> QRectF:
-        """Return the clickable mini-pill copy button hitbox during expanded IDLE_BAR hover."""
-        return QRectF(float(self.width()) - 42.0, 4.0, 38.0, float(self.height()) - 8.0)
+    def _mic_button_rect(self) -> QRectF:
+        """Left capsule hitbox for voice dictation during expanded IDLE_BAR."""
+        return QRectF(1.0, 1.0, 47.0, float(self.height()) - 2.0)
+
+    def _notetaker_button_rect(self) -> QRectF:
+        """Right circular Notetaker button hitbox inside the dual-button IDLE_BAR."""
+        return QRectF(52.0, 1.0, 33.0, float(self.height()) - 2.0)
+
+    def _menu_button_rect(self) -> QRectF:
+        """Chevron menu hitbox revealed to the right of Notetaker when hovering right button."""
+        return QRectF(85.0, 1.0, 32.0, float(self.height()) - 2.0)
+
+    def _hide_hover_tooltip(self) -> None:
+        if hasattr(self, "_tooltip_popup") and self._tooltip_popup.isVisible():
+            self._tooltip_popup.hide()
+
+    def _sync_hover_tooltip(self) -> None:
+        if (
+            self._mode != PillMode.IDLE_BAR
+            or self._hover_progress < 0.8
+            or self._context_menu_open
+            or self._drag_offset is not None
+            or not self._idle_hover_zone
+        ):
+            self._hide_hover_tooltip()
+            return
+        if self._idle_hover_zone == "mic":
+            self._tooltip_popup.show_above(
+                self.frameGeometry(),
+                tr("pill.tip.dictate", self._lang),
+                self._idle_hint_text,
+                self._resolved_theme,
+            )
+        elif self._idle_hover_zone == "notetaker":
+            self._tooltip_popup.show_above(
+                self.frameGeometry(),
+                tr("pill.tip.notetaker", self._lang),
+                "",
+                self._resolved_theme,
+            )
+        elif self._idle_hover_zone == "menu":
+            self._tooltip_popup.show_above(
+                self.frameGeometry(),
+                tr("pill.tip.menu", self._lang),
+                "",
+                self._resolved_theme,
+            )
+        else:
+            self._hide_hover_tooltip()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._hover_watch_timer.stop()
+        self._hide_hover_tooltip()
+        super().closeEvent(event)
 
     def _apply_idle_geometry(self) -> None:
-        w, h = self._idle_dimensions()
+        base_w, _extra_w, w, h = self._idle_layout_metrics()
         self._pill_offset_x = 0
         self._pill_body_width = w
 
         if self._drag_offset is not None:
             old_pos = self.pos()
             old_w, old_h = self.width(), self.height()
-            new_x = old_pos.x() + (old_w - w) // 2
+            new_x = old_pos.x()
             new_y = old_pos.y() + (old_h - h)
             self.setFixedSize(w, h)
             self.move(QPoint(new_x, new_y))
@@ -227,7 +400,7 @@ class FloatingPillWidget(QWidget):
         if self._saved_pos is not None and self._is_point_on_any_screen(self._saved_pos):
             anchor_x = self._saved_pos.x()
             anchor_y = self._saved_pos.y()
-            x = anchor_x + (COMPACT_WIDTH - w) // 2
+            x = anchor_x + (COMPACT_WIDTH - base_w) // 2
             y = anchor_y + PILL_HEIGHT - h
             screen = self._screen_for_point(self._saved_pos)
             if screen is not None:
@@ -255,7 +428,7 @@ class FloatingPillWidget(QWidget):
         geo = screen.availableGeometry()
         anchor_x = geo.x() + (geo.width() - COMPACT_WIDTH) // 2
         anchor_y = geo.y() + geo.height() - PILL_HEIGHT - 22
-        x = anchor_x + (COMPACT_WIDTH - w) // 2
+        x = anchor_x + (COMPACT_WIDTH - base_w) // 2
         y = anchor_y + PILL_HEIGHT - h
         self.setFixedSize(w, h)
         self.move(QPoint(x, y))
@@ -368,24 +541,70 @@ class FloatingPillWidget(QWidget):
         if self._mode == PillMode.IDLE_BAR:
             self._hovered = True
             self.setCursor(Qt.CursorShape.PointingHandCursor)
+            if not self._hover_watch_timer.isActive():
+                self._hover_watch_timer.start()
             if not self._anim_timer.isActive():
                 self._anim_timer.start()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
-        if self._cancel_hovered or self._copy_hovered:
+        if (
+            self._mode == PillMode.IDLE_BAR
+            and not self._context_menu_open
+            and self._drag_offset is None
+            and self.isVisible()
+            and self.frameGeometry().contains(QCursor.pos())
+        ):
+            self._hovered = True
+            self._leave_timer.stop()
+            if not self._hover_watch_timer.isActive():
+                self._hover_watch_timer.start()
+            super().leaveEvent(event)
+            return
+        if self._cancel_hovered or self._idle_hover_zone:
             self._cancel_hovered = False
-            self._copy_hovered = False
+            self._idle_hover_zone = ""
             self.setToolTip("")
+            if self._right_expand_progress > 0.0 and not self._anim_timer.isActive():
+                self._anim_timer.start()
             self.update()
+        self._hide_hover_tooltip()
         if self._mode == PillMode.IDLE_BAR and not self._context_menu_open and self._drag_offset is None:
             self._leave_timer.start()
         super().leaveEvent(event)
 
+    def _check_idle_hover_cursor(self) -> None:
+        if self._mode != PillMode.IDLE_BAR or not self._hovered or not self.isVisible():
+            self._hover_watch_timer.stop()
+            return
+        if self._context_menu_open or self._drag_offset is not None:
+            return
+        if self.frameGeometry().contains(QCursor.pos()):
+            if self._leave_timer.isActive():
+                self._leave_timer.stop()
+            return
+        if self._idle_hover_zone:
+            self._idle_hover_zone = ""
+            self.setToolTip("")
+            if self._right_expand_progress > 0.0 and not self._anim_timer.isActive():
+                self._anim_timer.start()
+            self.update()
+        self._hide_hover_tooltip()
+        if not self._leave_timer.isActive():
+            self._leave_timer.start()
+
     def _collapse_idle_hover(self) -> None:
         if self._mode == PillMode.IDLE_BAR and not self._context_menu_open and self._drag_offset is None:
+            if self.isVisible() and self.frameGeometry().contains(QCursor.pos()):
+                self._hovered = True
+                self._leave_timer.stop()
+                if not self._hover_watch_timer.isActive():
+                    self._hover_watch_timer.start()
+                return
+            self._hover_watch_timer.stop()
             self._hovered = False
-            self._copy_hovered = False
+            self._idle_hover_zone = ""
+            self._hide_hover_tooltip()
             self.setToolTip("")
             self.setCursor(Qt.CursorShape.OpenHandCursor)
             if not self._anim_timer.isActive():
@@ -393,16 +612,20 @@ class FloatingPillWidget(QWidget):
 
     def set_context_menu_open(self, is_open: bool) -> None:
         self._context_menu_open = bool(is_open)
-        if not is_open and self._mode == PillMode.IDLE_BAR and not self.underMouse():
+        if is_open:
+            self._hide_hover_tooltip()
+        elif self._mode == PillMode.IDLE_BAR and not self.frameGeometry().contains(QCursor.pos()):
             self._leave_timer.start()
 
     def contextMenuEvent(self, event) -> None:  # type: ignore[override]
         self._leave_timer.stop()
+        self._hide_hover_tooltip()
         self.context_menu_requested.emit(event.globalPos())
         event.accept()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.LeftButton:
+            self._hide_hover_tooltip()
             self._press_global_pos = event.globalPosition().toPoint()
             self._drag_offset = self._press_global_pos - self.frameGeometry().topLeft()
             self._did_drag = False
@@ -430,12 +653,33 @@ class FloatingPillWidget(QWidget):
                     Qt.CursorShape.PointingHandCursor if over_cancel else Qt.CursorShape.OpenHandCursor
                 )
                 self.update()
-        elif self._mode == PillMode.IDLE_BAR and self._hover_progress >= 0.5:
-            over_copy = self._copy_button_rect().contains(event.position())
-            if over_copy != self._copy_hovered:
-                self._copy_hovered = over_copy
-                self.setToolTip(tr("pill.copy_tooltip", self._lang) if over_copy else "")
-                self.update()
+        elif self._mode == PillMode.IDLE_BAR:
+            self._leave_timer.stop()
+            if not self._hovered:
+                self._hovered = True
+                if not self._anim_timer.isActive():
+                    self._anim_timer.start()
+            if not self._hover_watch_timer.isActive():
+                self._hover_watch_timer.start()
+            if self._hover_progress >= 0.5:
+                pos = event.position()
+                if self._notetaker_button_rect().contains(pos):
+                    zone = "notetaker"
+                elif self._right_expand_progress >= 0.45 and self._menu_button_rect().contains(pos):
+                    zone = "menu"
+                elif self._mic_button_rect().contains(pos):
+                    zone = "mic"
+                elif self.rect().contains(pos.toPoint()):
+                    zone = self._idle_hover_zone if self._idle_hover_zone in ("mic", "notetaker") else "mic"
+                else:
+                    zone = ""
+                if zone != self._idle_hover_zone:
+                    self._idle_hover_zone = zone
+                    self._sync_hover_tooltip()
+                    right_target = 1.0 if zone in ("notetaker", "menu") else 0.0
+                    if abs(self._right_expand_progress - right_target) > 1e-4 and not self._anim_timer.isActive():
+                        self._anim_timer.start()
+                    self.update()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
@@ -453,7 +697,8 @@ class FloatingPillWidget(QWidget):
             if was_drag:
                 pos = self.pos()
                 if self._mode == PillMode.IDLE_BAR:
-                    anchor_x = pos.x() - (COMPACT_WIDTH - self.width()) // 2
+                    base_w = self._idle_layout_metrics()[0]
+                    anchor_x = pos.x() - (COMPACT_WIDTH - base_w) // 2
                     anchor_y = pos.y() - (PILL_HEIGHT - self.height())
                 elif self._mode in (PillMode.NOTICE, PillMode.DOWNLOADING, PillMode.WARMING):
                     anchor_x = pos.x() - (COMPACT_WIDTH - self.width()) // 2
@@ -465,9 +710,22 @@ class FloatingPillWidget(QWidget):
                 self.position_changed.emit(self._saved_pos.x(), self._saved_pos.y())
             else:
                 if self._mode == PillMode.IDLE_BAR:
-                    if self._hover_progress >= 0.5 and self._copy_button_rect().contains(event.position()):
-                        self.copy_last_requested.emit()
+                    if self._hover_progress >= 0.5:
+                        if self._notetaker_button_rect().contains(event.position()):
+                            self._hide_hover_tooltip()
+                            self.meeting_clicked.emit()
+                        elif self._right_expand_progress >= 0.45 and self._menu_button_rect().contains(
+                            event.position()
+                        ):
+                            self._leave_timer.stop()
+                            self._hide_hover_tooltip()
+                            anchor = self.mapToGlobal(QPoint(self.width() // 2, 0))
+                            self.context_menu_requested.emit(anchor)
+                        else:
+                            self._hide_hover_tooltip()
+                            self.toggle_requested.emit()
                     else:
+                        self._hide_hover_tooltip()
                         self.toggle_requested.emit()
                 elif self._mode == PillMode.RECORDING:
                     if self._cancel_button_rect().contains(event.position()):
@@ -543,13 +801,16 @@ class FloatingPillWidget(QWidget):
     def show_idle_bar(self) -> None:
         self._hide_timer.stop()
         self._leave_timer.stop()
+        self._hover_watch_timer.stop()
+        self._hide_hover_tooltip()
         self._mode = PillMode.IDLE_BAR
         self._command_mode = False
         self._preview_text = ""
         self._cancel_hovered = False
-        self._copy_hovered = False
+        self._idle_hover_zone = ""
         self._hovered = False
         self._hover_progress = 0.0
+        self._right_expand_progress = 0.0
         self._anim_timer.stop()
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self._apply_idle_geometry()
@@ -560,13 +821,16 @@ class FloatingPillWidget(QWidget):
     def show_recording(self, *, command_mode: bool = False) -> None:
         self._hide_timer.stop()
         self._leave_timer.stop()
+        self._hover_watch_timer.stop()
+        self._hide_hover_tooltip()
         self._mode = PillMode.RECORDING
         self._command_mode = bool(command_mode)
         self._preview_text = ""
         self._hovered = False
         self._hover_progress = 0.0
+        self._right_expand_progress = 0.0
         self._cancel_hovered = False
-        self._copy_hovered = False
+        self._idle_hover_zone = ""
         self._elapsed_sec = 0.0
         self._target_level = 0.0
         self._bars = [0.14] * 9
@@ -580,6 +844,8 @@ class FloatingPillWidget(QWidget):
     def show_transcribing(self) -> None:
         self._hide_timer.stop()
         self._leave_timer.stop()
+        self._hover_watch_timer.stop()
+        self._hide_hover_tooltip()
         self._mode = PillMode.TRANSCRIBING
         self._preview_text = ""
         self._cancel_hovered = False
@@ -592,6 +858,8 @@ class FloatingPillWidget(QWidget):
     def show_polishing(self, label: str | None = None) -> None:
         self._hide_timer.stop()
         self._leave_timer.stop()
+        self._hover_watch_timer.stop()
+        self._hide_hover_tooltip()
         self._mode = PillMode.POLISHING
         default_lbl = tr("pill.polishing", self._lang)
         self._processing_label = (label or default_lbl).strip() or default_lbl
@@ -607,6 +875,8 @@ class FloatingPillWidget(QWidget):
         """Show compact download progress inside the Flow Bar (clicking opens Settings)."""
         self._hide_timer.stop()
         self._leave_timer.stop()
+        self._hover_watch_timer.stop()
+        self._hide_hover_tooltip()
         self._mode = PillMode.DOWNLOADING
         self._command_mode = False
         self._preview_text = ""
@@ -634,6 +904,8 @@ class FloatingPillWidget(QWidget):
         """Show calm animated model warm-up countdown (never alarming red)."""
         self._hide_timer.stop()
         self._leave_timer.stop()
+        self._hover_watch_timer.stop()
+        self._hide_hover_tooltip()
         self._mode = PillMode.WARMING
         self._command_mode = False
         self._preview_text = ""
@@ -651,6 +923,8 @@ class FloatingPillWidget(QWidget):
 
     def show_notice(self, text: str, *, is_error: bool = False, duration_ms: int = 2200) -> None:
         self._leave_timer.stop()
+        self._hover_watch_timer.stop()
+        self._hide_hover_tooltip()
         self._mode = PillMode.NOTICE
         self._command_mode = False
         self._preview_text = ""
@@ -675,14 +949,17 @@ class FloatingPillWidget(QWidget):
     def hide_pill(self) -> None:
         self._hide_timer.stop()
         self._leave_timer.stop()
+        self._hover_watch_timer.stop()
         self._anim_timer.stop()
+        self._hide_hover_tooltip()
         self._mode = PillMode.HIDDEN
         self._command_mode = False
         self._preview_text = ""
         self._hovered = False
         self._hover_progress = 0.0
+        self._right_expand_progress = 0.0
         self._cancel_hovered = False
-        self._copy_hovered = False
+        self._idle_hover_zone = ""
         self._pill_offset_x = 0
         self._pill_body_width = COMPACT_WIDTH
         self._drag_offset = None
@@ -696,23 +973,37 @@ class FloatingPillWidget(QWidget):
     # Animation & Painting
     # ------------------------------------------------------------------
     def _on_tick(self) -> None:
-        self._phase += 0.34
+        self._phase += 0.22
         if self._mode == PillMode.IDLE_BAR:
             target = 1.0 if self._hovered else 0.0
-            step = 0.22 if self._hovered else 0.16
+            step = 0.14 if self._hovered else 0.15
             if abs(self._hover_progress - target) <= step:
                 self._hover_progress = target
-                self._anim_timer.stop()
             elif self._hover_progress < target:
                 self._hover_progress += step
             else:
                 self._hover_progress -= step
+
+            right_want = self._hovered and self._idle_hover_zone in ("notetaker", "menu")
+            right_target = 1.0 if right_want else 0.0
+            right_step = 0.14 if right_want else 0.12
+            if abs(self._right_expand_progress - right_target) <= right_step:
+                self._right_expand_progress = right_target
+            elif self._right_expand_progress < right_target:
+                self._right_expand_progress += right_step
+            else:
+                self._right_expand_progress -= right_step
+
+            if self._hover_progress == target and self._right_expand_progress == right_target:
+                self._anim_timer.stop()
+
             self._apply_idle_geometry()
+            self._sync_hover_tooltip()
             self.update()
             return
 
         if self._mode == PillMode.RECORDING:
-            self._elapsed_sec += 0.025
+            self._elapsed_sec += 0.016
             if self._level_provider is not None:
                 self._target_level = max(0.0, min(1.0, self._level_provider()))
 
@@ -723,7 +1014,7 @@ class FloatingPillWidget(QWidget):
                 envelope = 1.0 - 0.32 * dist
                 harmonic = 0.55 + 0.45 * math.sin(self._phase * 1.45 - abs(i - center) * 0.95 + i * 0.35)
                 target = 0.14 + (0.86 * lvl * envelope * harmonic)
-                alpha = 0.72 if target > self._bars[i] else 0.32
+                alpha = 0.50 if target > self._bars[i] else 0.21
                 self._bars[i] = self._bars[i] * (1.0 - alpha) + target * alpha
         self.update()
 
@@ -815,6 +1106,8 @@ class FloatingPillWidget(QWidget):
         """Show compact active meeting indicator inside the Flow Bar."""
         self._hide_timer.stop()
         self._leave_timer.stop()
+        self._hover_watch_timer.stop()
+        self._hide_hover_tooltip()
         self._mode = PillMode.MEETING
         self._command_mode = False
         self._preview_text = ""
@@ -834,7 +1127,7 @@ class FloatingPillWidget(QWidget):
         hrs, mins = divmod(mins, 60)
         ts = f"{hrs:02d}:{mins:02d}:{secs:02d}" if hrs > 0 else f"{mins:02d}:{secs:02d}"
 
-        pulse = 0.65 + 0.35 * math.sin(self._phase * 2.0)
+        pulse = 0.55 + 0.45 * math.sin(self._phase * 0.30)
         dot_color = QColor(239, 68, 68, int(round(255 * pulse)))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(dot_color)
@@ -850,7 +1143,8 @@ class FloatingPillWidget(QWidget):
 
     def _paint_idle_bar(self, painter: QPainter) -> None:
         is_light = self._resolved_theme == "light"
-        t = 1.0 - (1.0 - self._hover_progress) ** 2
+        t = 1.0 - (1.0 - self._hover_progress) ** 3
+        r = 1.0 - (1.0 - self._right_expand_progress) ** 3
         if t < 0.05:
             # Thin ambient resting bar centered inside the bottom hitbox
             bx = (self.width() - IDLE_BAR_WIDTH) / 2.0
@@ -875,108 +1169,100 @@ class FloatingPillWidget(QWidget):
             painter.drawRoundedRect(QRectF(rect.center().x() - 7.0, rect.center().y() - 1.0, 14.0, 2.0), 1.0, 1.0)
             return
 
-        # Smoothly expanded glass hover capsule
-        rect = QRectF(0.75, 0.75, self.width() - 1.5, self.height() - 1.5)
-        radius = rect.height() / 2.0
-        path = QPainterPath()
-        path.addRoundedRect(rect, radius, radius)
+        # Expanded dual-button bar: [mic] + (◉) in resting hover, expanding to [mic] + [◉ | ^] on right hover
+        content_alpha = int(255 * max(0.0, min(1.0, (t - 0.15) / 0.85)))
+        h = float(self.height())
+        w = float(self.width())
+        # Nearly invisible hit-test bridge across the full expanded rect so Windows
+        # layered hit-testing never drops hover in the 4px transparent gap between capsules.
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 1))
+        painter.drawRect(QRectF(0.0, 0.0, w, h))
+        gap = 4.0
+        base_w = IDLE_HITBOX_WIDTH + (HOVER_WIDTH - IDLE_HITBOX_WIDTH) * t
+        left_w = min(47.0, max(24.0, (base_w - gap) * 0.57))
+        left_rect = QRectF(0.75, 0.75, left_w, h - 1.5)
+        right_x = left_rect.right() + gap
+        right_w = max(22.0, w - right_x - 0.75)
+        right_rect = QRectF(right_x, 0.75, right_w, h - 1.5)
 
-        bg_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
         if is_light:
-            bg_grad.setColorAt(0.0, QColor(255, 255, 255, int(225 + 23 * t)))
-            bg_grad.setColorAt(1.0, QColor(242, 243, 247, int(228 + 22 * t)))
+            cap_base = QColor(255, 255, 255, int(235 + 15 * t))
+            cap_hover = QColor(238, 238, 243, int(245))
+            cap_border = QColor(24, 24, 27, int(42 * t + 18))
+            fg_bright = QColor(24, 24, 27, max(40, content_alpha))
+            circle_hover = QColor(24, 24, 27, 26)
         else:
-            bg_grad.setColorAt(0.0, QColor(24, 27, 36, int(215 + 27 * t)))
-            bg_grad.setColorAt(1.0, QColor(12, 14, 19, int(220 + 26 * t)))
-        painter.fillPath(path, bg_grad)
+            cap_base = QColor(22, 22, 26, int(230 + 20 * t))
+            cap_hover = QColor(48, 48, 54, int(245))
+            cap_border = QColor(255, 255, 255, int(44 * t + 14))
+            fg_bright = QColor(248, 250, 252, max(40, content_alpha))
+            circle_hover = QColor(255, 255, 255, 42)
 
-        border_grad = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
-        if is_light:
-            border_grad.setColorAt(0.0, QColor(24, 24, 27, int(42 * t + 20)))
-            border_grad.setColorAt(1.0, QColor(24, 24, 27, int(24 * t + 14)))
-        else:
-            border_grad.setColorAt(0.0, QColor(255, 255, 255, int(68 * t + 28)))
-            border_grad.setColorAt(1.0, QColor(255, 255, 255, int(22 * t + 10)))
-        painter.setPen(QPen(border_grad, 1.0))
-        painter.drawPath(path)
+        # Left capsule (Dictate microphone)
+        left_path = QPainterPath()
+        left_path.addRoundedRect(left_rect, left_rect.height() / 2.0, left_rect.height() / 2.0)
+        painter.fillPath(
+            left_path,
+            cap_hover if self._idle_hover_zone == "mic" else cap_base,
+        )
+        painter.setPen(QPen(cap_border, 1.0))
+        painter.drawPath(left_path)
 
-        content_alpha = int(255 * max(0.0, min(1.0, (t - 0.25) / 0.75)))
+        # Right capsule (Notetaker circle at rest; expands rightward to reveal menu chevron on hover)
+        right_path = QPainterPath()
+        right_path.addRoundedRect(right_rect, right_rect.height() / 2.0, right_rect.height() / 2.0)
+        painter.fillPath(right_path, cap_base)
+
+        nt_cx = right_rect.left() + min(16.0, right_w / 2.0)
+        cy = h / 2.0
+        if content_alpha > 0 and self._idle_hover_zone in ("notetaker", "menu"):
+            painter.save()
+            try:
+                painter.setClipPath(right_path)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(circle_hover)
+                if self._idle_hover_zone == "notetaker":
+                    painter.drawEllipse(QPointF(nt_cx, cy), 13.0, 13.0)
+                elif self._idle_hover_zone == "menu" and r > 0.35:
+                    painter.drawEllipse(QPointF(right_rect.right() - 16.0, cy), 13.0, 13.0)
+            finally:
+                painter.restore()
+
+        painter.setPen(QPen(cap_border, 1.0))
+        painter.drawPath(right_path)
+
         if content_alpha <= 0:
             return
 
-        # Vector microphone glyph on the left
-        cx = 21.0
-        cy = self.height() / 2.0
-        fg_color = (
-            QColor(24, 24, 27, content_alpha)
-            if is_light
-            else QColor(229, 231, 235, content_alpha)
-        )
-        painter.setPen(QPen(fg_color, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        # Mic icon inside left capsule
+        mx = left_rect.center().x()
+        my = h / 2.0
+        painter.setPen(QPen(fg_bright, 1.45, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(QRectF(cx - 2.6, cy - 6.2, 5.2, 8.2), 2.5, 2.5)
-        painter.drawArc(QRectF(cx - 5.2, cy - 3.2, 10.4, 8.2), 200 * 16, 140 * 16)
-        painter.drawLine(QPointF(cx, cy + 5.0), QPointF(cx, cy + 7.2))
+        painter.drawRoundedRect(QRectF(mx - 2.3, my - 6.0, 4.6, 7.6), 2.3, 2.3)
+        painter.drawArc(QRectF(mx - 4.7, my - 3.0, 9.4, 7.4), 190 * 16, 160 * 16)
+        painter.drawLine(QPointF(mx, my + 4.5), QPointF(mx, my + 6.7))
+        painter.drawLine(QPointF(mx - 2.2, my + 6.7), QPointF(mx + 2.2, my + 6.7))
 
-        # Compact copy-last mini-pill button on the right
-        alpha_f = content_alpha / 255.0
-        btn_w = 34.0
-        btn_h = 20.0
-        btn_x = float(self.width()) - btn_w - 6.0
-        btn_y = (float(self.height()) - btn_h) / 2.0
-        btn_rect = QRectF(btn_x, btn_y, btn_w, btn_h)
-        btn_path = QPainterPath()
-        btn_path.addRoundedRect(btn_rect, btn_h / 2.0, btn_h / 2.0)
-
-        if is_light:
-            if self._copy_hovered:
-                btn_bg = QColor(124, 58, 237, int(24 * alpha_f))
-                btn_border = QColor(124, 58, 237, int(175 * alpha_f))
-                icon_color = QColor(88, 28, 135, content_alpha)
-            elif self._has_last_dictation:
-                btn_bg = QColor(24, 24, 27, int(14 * alpha_f))
-                btn_border = QColor(24, 24, 27, int(34 * alpha_f))
-                icon_color = QColor(39, 39, 42, content_alpha)
-            else:
-                btn_bg = QColor(24, 24, 27, int(8 * alpha_f))
-                btn_border = QColor(24, 24, 27, int(20 * alpha_f))
-                icon_color = QColor(113, 113, 122, int(content_alpha * 0.65))
-        else:
-            if self._copy_hovered:
-                btn_bg = QColor(255, 255, 255, int(44 * alpha_f))
-                btn_border = QColor(167, 139, 250, int(195 * alpha_f))
-                icon_color = QColor(255, 255, 255, content_alpha)
-            elif self._has_last_dictation:
-                btn_bg = QColor(255, 255, 255, int(20 * alpha_f))
-                btn_border = QColor(255, 255, 255, int(52 * alpha_f))
-                icon_color = QColor(226, 232, 240, content_alpha)
-            else:
-                btn_bg = QColor(255, 255, 255, int(10 * alpha_f))
-                btn_border = QColor(255, 255, 255, int(26 * alpha_f))
-                icon_color = QColor(148, 163, 184, int(content_alpha * 0.65))
-
-        painter.fillPath(btn_path, btn_bg)
-        painter.setPen(QPen(btn_border, 1.0))
-        painter.drawPath(btn_path)
-
-        # Crisp vector copy icon (two overlapping rounded sheets) centered inside the mini-pill
-        icx = btn_rect.center().x()
-        icy = btn_rect.center().y()
-        painter.setPen(QPen(icon_color, 1.25, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        # Concentric Notetaker record glyph inside right circle
+        painter.setPen(QPen(fg_bright, 1.45))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        # Back sheet (top-left L-shape so it doesn't cross through front sheet)
-        back_path = QPainterPath()
-        back_path.moveTo(icx - 2.6, icy + 1.8)
-        back_path.lineTo(icx - 4.0, icy + 1.8)
-        back_path.quadTo(icx - 5.2, icy + 1.8, icx - 5.2, icy + 0.6)
-        back_path.lineTo(icx - 5.2, icy - 4.0)
-        back_path.quadTo(icx - 5.2, icy - 5.2, icx - 4.0, icy - 5.2)
-        back_path.lineTo(icx + 0.6, icy - 5.2)
-        back_path.quadTo(icx + 1.8, icy - 5.2, icx + 1.8, icy - 4.0)
-        back_path.lineTo(icx + 1.8, icy - 2.8)
-        painter.drawPath(back_path)
-        # Front sheet
-        painter.drawRoundedRect(QRectF(icx - 2.0, icy - 2.4, 7.2, 7.6), 1.4, 1.4)
+        painter.drawEllipse(QPointF(nt_cx, my), 6.0, 6.0)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(fg_bright)
+        painter.drawEllipse(QPointF(nt_cx, my), 2.7, 2.7)
+
+        # Up-chevron fades/slides in only while hovering the right button (r > 0.25)
+        chevron_alpha = int(255 * max(0.0, min(1.0, (r - 0.25) / 0.75)) * (content_alpha / 255.0))
+        if chevron_alpha > 0 and right_w >= 46.0:
+            ch_color = QColor(82, 82, 91, chevron_alpha) if is_light else QColor(212, 212, 216, chevron_alpha)
+            ch_cx = right_rect.right() - 16.0
+            painter.setPen(
+                QPen(ch_color, 1.45, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            )
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline([QPointF(ch_cx - 3.6, my + 1.6), QPointF(ch_cx, my - 2.0), QPointF(ch_cx + 3.6, my + 1.6)])
 
     def _paint_preview(self, painter: QPainter) -> None:
         is_light = self._resolved_theme == "light"
@@ -1049,7 +1335,7 @@ class FloatingPillWidget(QWidget):
             painter.drawRoundedRect(QRectF(x, y, bar_w, h), 1.2, 1.2)
 
         # Pulsing active dot + compact timer on the right
-        pulse = 0.6 + 0.4 * math.sin(self._phase * 1.1)
+        pulse = 0.55 + 0.45 * math.sin(self._phase * 0.28)
         dot_rgb = (124, 58, 237) if (self._command_mode and is_light) else (
             (167, 139, 250) if self._command_mode else (239, 68, 68)
         )

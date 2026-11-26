@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import math
 from enum import Enum
+import sys
 import threading
 import time
 
 import numpy as np
 from PySide6.QtCore import QObject, QPoint, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from localflow.asr.chunked_session import ChunkedASRSession
@@ -50,8 +53,13 @@ from localflow.notetaker.session import MeetingSession
 from localflow.notetaker.storage import MeetingStorage
 from localflow.notetaker.summarizer import MeetingSummarizer
 from localflow.styles import apply_style_postprocessing, resolve_style_profile, strip_final_period
-from localflow.ui.context_menu import QuickMenuCallbacks, QuickMenuState, build_quick_menu
-from localflow.ui.meeting_window import MeetingSideWindow
+from localflow.ui.context_menu import (
+    QuickMenuCallbacks,
+    QuickMenuState,
+    build_pill_menu,
+    build_quick_menu,
+)
+from localflow.ui.meeting_window import MeetingSideWindow, ShortMeetingModal
 from localflow.ui.overlay_pill import FloatingPillWidget
 from localflow.ui.settings_window import SettingsWindow
 from localflow.ui.theme import resolve_theme
@@ -139,6 +147,7 @@ class LocalFlowController(QObject):
         recent = self._storage.list_recent(limit=1)
         self._last_dictation_text: str = recent[0].final_text if recent else ""
         self._last_raw_text: str = recent[0].raw_text if recent else ""
+        self._last_external_hwnd: int | None = None
         self._pool = QThreadPool.globalInstance()
 
         self._snooze_timer = QTimer(self)
@@ -373,7 +382,7 @@ class LocalFlowController(QObject):
             self._on_ollama_start_status, Qt.ConnectionType.QueuedConnection
         )
 
-        self._tray.open_settings_requested.connect(self._settings.show_and_focus)
+        self._tray.open_settings_requested.connect(self._settings.show_settings)
         self._tray.toggle_llm_requested.connect(self._on_toggle_llm_from_tray)
         self._tray.profile_selected.connect(self._on_profile_selected)
         self._tray.mic_selected.connect(self._on_mic_selected)
@@ -710,7 +719,7 @@ class LocalFlowController(QObject):
         if active is not None:
             self._meeting_window.open_for_meeting(active.id, recording=True)
         else:
-            self._settings.show_notetaker()
+            self.start_meeting(self._config.notetaker_audio_mode)
 
     def _sync_hub_from_side_window(self, mid: int) -> None:
         nt = self._settings.notetaker_tab
@@ -744,8 +753,40 @@ class LocalFlowController(QObject):
 
         self._pool.start(_FnWorker(_worker))
 
+    def _is_meeting_accidental(self, meeting_id: int) -> bool:
+        meeting = self._meeting_storage.get_meeting(meeting_id)
+        if meeting is None or (meeting.summary_md or "").strip():
+            return False
+        utterances = self._meeting_storage.get_utterances(meeting_id)
+        word_count = sum(len(u.text.split()) for u in utterances)
+        return word_count < 15 or (meeting.duration_sec < 12.0 and word_count < 25)
+
+    def _confirm_short_meeting(self, meeting_id: int) -> str:
+        dlg = ShortMeetingModal(
+            lang=self._lang,
+            theme=resolve_theme(self._config.theme),
+            anchor_widget=self._meeting_window if self._meeting_window.isVisible() else None,
+        )
+        dlg.exec()
+        return dlg.choice
+
     def _on_meeting_stopped_ui(self, meeting_id: int) -> None:
         self._restore_pill_idle()
+        if self._is_meeting_accidental(meeting_id):
+            self._meeting_storage.update_meeting(meeting_id, status="done")
+            self._settings.notetaker_tab.notify_summary_done(meeting_id, too_short=True)
+            self._meeting_window.workspace.set_summary_done(meeting_id, too_short=True)
+            if self._confirm_short_meeting(meeting_id) == "discard":
+                self._meeting_storage.delete_meeting(meeting_id, hard=True)
+                if self._meeting_window.workspace.current_meeting_id == meeting_id:
+                    self._meeting_window.hide()
+                self._settings.notetaker_tab.refresh_meetings()
+                self._pill.show_notice(
+                    tr("notetaker.discarded_notice", self._lang),
+                    duration_ms=1600,
+                )
+                return
+
         self._settings.notetaker_tab.refresh_meetings(select_id=meeting_id)
         self._meeting_window.workspace.set_meeting(meeting_id)
         if self._config.llm_enabled:
@@ -831,6 +872,58 @@ class LocalFlowController(QObject):
             clipboard.setText(text)
         self._pill.show_notice(tr("notice.last_copied", self._lang), duration_ms=1600)
 
+    def _capture_external_hwnd(self) -> int | None:
+        if sys.platform != "win32":
+            return None
+        try:
+            hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+            if not hwnd:
+                return None
+            own_hwnds: set[int] = set()
+            for w in (self._pill, self._settings, self._meeting_window):
+                try:
+                    if w is not None and w.isVisible():
+                        own_hwnds.add(int(w.winId()))
+                except Exception:
+                    pass
+            return None if hwnd in own_hwnds else hwnd
+        except Exception:
+            return None
+
+    def _on_paste_last_dictation(self) -> None:
+        text = self._last_dictation_text
+        if not text:
+            recent = self._storage.list_recent(limit=1)
+            if recent:
+                text = recent[0].final_text
+                self._last_dictation_text = text
+        if not text:
+            self._pill.show_notice(tr("notice.no_last_dictation", self._lang), duration_ms=1600)
+            return
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
+        target_hwnd = self._last_external_hwnd
+        self._last_external_hwnd = None
+        paste_delay_ms = self._config.paste_delay_ms
+        injector = self._injector
+
+        def _work() -> None:
+            if sys.platform == "win32" and target_hwnd:
+                try:
+                    ctypes.windll.user32.SetForegroundWindow(target_hwnd)
+                    time.sleep(0.04)
+                except Exception:
+                    pass
+            injector.inject(
+                text,
+                auto_space=False,
+                restore_clipboard=False,
+                paste_delay_ms=paste_delay_ms,
+            )
+
+        self._pool.start(_FnWorker(_work))
+
     def _on_copy_last_raw(self) -> None:
         text = self._last_raw_text
         if not text:
@@ -855,6 +948,9 @@ class LocalFlowController(QObject):
     def _prompt_start_ollama(self, *, can_launch: bool) -> str:
         """Show a topmost modal prompt asking the user to start Ollama."""
         box = QMessageBox()
+        from localflow.ui.theme import apply_windows_titlebar_theme, build_dialog_stylesheet, resolve_theme
+
+        resolved = resolve_theme(self._config.theme)
         box.setWindowTitle(tr("ollama_prompt.title", self._lang))
         box.setText(
             tr(
@@ -866,6 +962,8 @@ class LocalFlowController(QObject):
         )
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowFlags(box.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        box.setStyleSheet(build_dialog_stylesheet(resolved))
+        apply_windows_titlebar_theme(box, resolved)
         start_btn = (
             box.addButton(tr("ollama_prompt.btn_start", self._lang), QMessageBox.ButtonRole.AcceptRole)
             if can_launch
@@ -1392,20 +1490,38 @@ class LocalFlowController(QObject):
             on_reset_position=self._on_reset_pill_position,
             on_copy_last_dictation=self._on_copy_last_dictation,
             on_copy_last_raw=self._on_copy_last_raw,
-            on_open_settings=self._settings.show_and_focus,
+            on_open_settings=self._settings.show_settings,
             on_toggle_meeting=self._on_toggle_meeting_default,
+            on_open_history=self._settings.show_history,
+            on_paste_last_dictation=self._on_paste_last_dictation,
             on_quit=self.shutdown,
         )
-        menu = build_quick_menu(
+        self._last_external_hwnd = self._capture_external_hwnd()
+        menu = build_pill_menu(
             state,
             callbacks,
             parent=self._pill,
             theme=resolve_theme(self._config.theme),
             lang=self._lang,
         )
+        sz = menu.sizeHint()
+        if self._pill.isVisible():
+            anchor = self._pill.frameGeometry()
+            popup_x = anchor.center().x() - sz.width() // 2
+            popup_y = anchor.top() - sz.height() - 10
+            screen = QGuiApplication.screenAt(anchor.center()) or QGuiApplication.primaryScreen()
+        else:
+            popup_x = global_pos.x() - sz.width() // 2
+            popup_y = global_pos.y() - sz.height() - 10
+            screen = QGuiApplication.screenAt(global_pos) or QGuiApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.availableGeometry()
+            popup_x = max(geo.x() + 6, min(popup_x, geo.x() + geo.width() - sz.width() - 6))
+            popup_y = max(geo.y() + 6, min(popup_y, geo.y() + geo.height() - sz.height() - 6))
+
         self._pill.set_context_menu_open(True)
         try:
-            menu.exec(global_pos)
+            menu.exec(QPoint(popup_x, popup_y))
         finally:
             self._pill.set_context_menu_open(False)
 

@@ -77,7 +77,7 @@ def test_existing_tray_actions_regression(make_tray, qtbot) -> None:
     tray.set_theme("light")
     assert "#ffffff" in tray.contextMenu().styleSheet()
     tray.set_theme("dark")
-    assert "#14171f" in tray.contextMenu().styleSheet()
+    assert "#18181b" in tray.contextMenu().styleSheet()
 
     # Live Russian language switch updates tray actions immediately
     tray.set_language("ru")

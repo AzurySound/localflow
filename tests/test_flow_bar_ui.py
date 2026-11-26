@@ -142,3 +142,69 @@ def test_settings_window_history_search_stats_and_show_idle_bar(tmp_path, monkey
         win._save_btn.click()
     assert blocker.args[0].show_idle_bar is False
     win.close()
+
+
+def test_build_pill_menu_matches_wispr_structure_and_callbacks(qtbot) -> None:
+    from localflow.ui.context_menu import build_pill_menu
+
+    events: list[tuple[str, object]] = []
+    state = QuickMenuState(
+        asr_status="ASR ready",
+        selected_mic_index=1,
+        profile="light_gpu",
+        llm_enabled=True,
+        live_preview_enabled=True,
+        show_idle_bar=True,
+        is_snoozed=False,
+    )
+    callbacks = QuickMenuCallbacks(
+        on_select_mic=lambda idx: events.append(("mic", idx)),
+        on_select_profile=lambda p: events.append(("profile", p)),
+        on_toggle_llm=lambda v: events.append(("llm", v)),
+        on_toggle_live_preview=lambda v: events.append(("preview", v)),
+        on_toggle_idle_bar=lambda v: events.append(("idle_bar", v)),
+        on_snooze_1h=lambda: events.append(("snooze", True)),
+        on_unsnooze=lambda: events.append(("unsnooze", True)),
+        on_reset_position=lambda: events.append(("reset_pos", True)),
+        on_copy_last_dictation=lambda: events.append(("copy_last", True)),
+        on_open_settings=lambda: events.append(("settings", True)),
+        on_open_history=lambda: events.append(("history", True)),
+        on_paste_last_dictation=lambda: events.append(("paste_last", True)),
+        on_quit=lambda: events.append(("quit", True)),
+    )
+    devices = [_FakeDevice(index=1, name="Mic One", is_default=True)]
+    menu = build_pill_menu(state, callbacks, devices=devices, theme="dark", lang="en")
+    actions = [a for a in menu.actions() if not a.isSeparator()]
+    assert [a.text() for a in actions] == [
+        "Hide for 1 hour",
+        "Reset position",
+        "Settings",
+        "Quit",
+        "Microphone",
+        "VRAM Mode",
+        "Paste last transcript",
+    ]
+    assert all(not a.icon().isNull() for a in actions)
+    assert "#141417" in menu.styleSheet()
+
+    # Reset position sits directly above Settings
+    actions[1].trigger()
+    assert ("reset_pos", True) in events
+
+    # Quit is directly under Settings and triggers on_quit
+    actions[3].trigger()
+    assert ("quit", True) in events
+
+    # VRAM Mode submenu allows switching profiles
+    mode_menu = actions[5].menu()
+    assert mode_menu is not None
+    quality_act = next(a for a in mode_menu.actions() if "Quality" in a.text())
+    quality_act.trigger()
+    assert ("profile", "quality") in events
+
+    # Paste last transcript invokes immediate-paste callback
+    actions[6].trigger()
+    assert ("paste_last", True) in events
+
+    light_menu = build_pill_menu(state, callbacks, devices=devices, theme="light", lang="en")
+    assert "#ffffff" in light_menu.styleSheet()

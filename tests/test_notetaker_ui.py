@@ -28,9 +28,36 @@ def test_notetaker_page_tabs_actions_theme_and_i18n(qtbot, tmp_path: Path) -> No
     assert ws.title_edit.text() == "Product Sync"
     assert "roadmap" in ws.summary_view.toPlainText()
 
-    # Toggle Action Item checkbox persists to SQLite
+    from localflow.ui.theme import build_hub_stylesheet
+    from localflow.ui.widgets import DropdownCombo
+
+    assert page._meeting_list.objectName() == "historyList"
+    assert isinstance(page._mode_combo, DropdownCombo)
+    assert page._record_btn.objectName() == "notetakerStartBtn"
+    assert "#7c3aed" in build_hub_stylesheet("dark")
+    assert "#991b1b" in build_hub_stylesheet("dark")
+    assert "#7c3aed" in build_hub_stylesheet("light")
+    assert "#991b1b" in build_hub_stylesheet("light")
+
+    page.set_recording_state(True, m.id)
+    assert page._record_btn.objectName() == "notetakerStopBtn"
+    page.set_recording_state(False, None)
+    assert page._record_btn.objectName() == "notetakerStartBtn"
+
+    # Toggle Action Item checkbox persists to SQLite and strikes through label
     cbs = ws.action_container.findChildren(QCheckBox)
     assert cbs
+    cbs[0].setChecked(True)
+    assert storage.get_action_items(m.id)[0].done is True
+    from localflow.ui.meeting_window import _ActionItemRow
+
+    rows = ws.action_container.findChildren(_ActionItemRow)
+    assert rows and rows[0]._lbl.font().strikeOut() is True
+    cbs[0].setChecked(False)
+    assert storage.get_action_items(m.id)[0].done is False
+    assert rows[0]._lbl.font().strikeOut() is False
+
+    # Check again for persistence test consistency
     cbs[0].setChecked(True)
     assert storage.get_action_items(m.id)[0].done is True
 
@@ -132,3 +159,97 @@ def test_overlay_pill_meeting_mode_paints_cleanly(qtbot) -> None:
     assert pill._mode == PillMode.WARMING
     pix_w = pill.grab()
     assert not pix_w.isNull()
+
+
+def test_short_meeting_modal_choices_and_render(qtbot) -> None:
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWidgets import QWidget
+
+    from localflow.ui.meeting_window import ShortMeetingModal
+
+    # Even with an off-center side anchor, modal positions horizontally centered near bottom of screen
+    side_anchor = QWidget()
+    side_anchor.setGeometry(10, 10, 300, 400)
+    side_anchor.show()
+    qtbot.addWidget(side_anchor)
+
+    dlg_dark = ShortMeetingModal(lang="en", theme="dark", anchor_widget=side_anchor)
+    qtbot.addWidget(dlg_dark)
+    screen = QGuiApplication.primaryScreen()
+    assert screen is not None
+    avail = screen.availableGeometry()
+    assert abs((dlg_dark.x() + dlg_dark.width() // 2) - (avail.x() + avail.width() // 2)) <= 2
+    assert dlg_dark.y() > avail.y() + avail.height() // 2
+
+    assert dlg_dark.choice == "keep"
+    pix_dark = dlg_dark.grab()
+    assert not pix_dark.isNull()
+    dlg_dark._discard_btn.click()
+    assert dlg_dark.choice == "discard"
+
+    dlg_light = ShortMeetingModal(lang="ru", theme="light")
+    qtbot.addWidget(dlg_light)
+    pix_light = dlg_light.grab()
+    assert not pix_light.isNull()
+    dlg_light._keep_btn.click()
+    assert dlg_light.choice == "keep"
+
+    dlg_close = ShortMeetingModal(lang="en", theme="dark")
+    qtbot.addWidget(dlg_close)
+    dlg_close._close_btn.click()
+    assert dlg_close.choice == "keep"
+
+
+def test_frameless_window_helper_resets_resize_cursor_inside_child_and_on_leave(qtbot) -> None:
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QHoverEvent
+    from PySide6.QtWidgets import QApplication, QFrame, QScrollArea, QVBoxLayout, QWidget
+
+    from localflow.ui.widgets import FramelessWindowHelper
+
+    win = QWidget()
+    qtbot.addWidget(win)
+    win.resize(400, 300)
+    lay = QVBoxLayout(win)
+    lay.setContentsMargins(0, 0, 0, 0)
+    shell = QFrame(win)
+    lay.addWidget(shell)
+    scroll = QScrollArea(shell)
+    scroll.setGeometry(20, 20, 360, 260)
+    child = QFrame()
+    child.setMouseTracking(True)
+    scroll.setWidget(child)
+    scroll.setWidgetResizable(True)
+
+    helper = FramelessWindowHelper(win, shell, titlebar_height=40)
+    win.show()
+    assert win.testAttribute(Qt.WidgetAttribute.WA_Hover)
+
+    # Hovering left edge sets horizontal resize cursor
+    edge_pt = QPointF(2.0, 120.0)
+    edge_global = QPointF(win.mapToGlobal(edge_pt.toPoint()))
+    QApplication.sendEvent(
+        win,
+        QHoverEvent(QEvent.Type.HoverMove, edge_pt, edge_global, edge_pt),
+    )
+    assert win.cursor().shape() == Qt.CursorShape.SizeHorCursor
+
+    # Moving back inside over child area (WA_Hover delivers HoverMove to win) resets cursor
+    inner_pt = QPointF(80.0, 120.0)
+    inner_global = QPointF(win.mapToGlobal(inner_pt.toPoint()))
+    QApplication.sendEvent(
+        win,
+        QHoverEvent(QEvent.Type.HoverMove, inner_pt, inner_global, edge_pt),
+    )
+    assert win.cursor().shape() == Qt.CursorShape.ArrowCursor
+    assert child.cursor().shape() == Qt.CursorShape.ArrowCursor
+
+    # Moving onto edge again then leaving window resets cursor on HoverLeave
+    QApplication.sendEvent(
+        win,
+        QHoverEvent(QEvent.Type.HoverMove, edge_pt, edge_global, inner_pt),
+    )
+    assert win.cursor().shape() == Qt.CursorShape.SizeHorCursor
+    QApplication.sendEvent(win, QEvent(QEvent.Type.HoverLeave))
+    assert win.cursor().shape() == Qt.CursorShape.ArrowCursor
+    assert helper is not None

@@ -10,7 +10,13 @@ from PySide6.QtWidgets import QMenu, QWidget
 
 from localflow.audio.recorder import AudioDeviceInfo, list_input_devices
 from localflow.i18n import DEFAULT_LANGUAGE, tr
-from localflow.ui.theme import ResolvedTheme, build_menu_stylesheet
+from localflow.ui.icons import render_icon
+from localflow.ui.theme import (
+    ResolvedTheme,
+    build_menu_stylesheet,
+    build_pill_menu_stylesheet,
+    get_theme_tokens,
+)
 
 
 def get_profile_labels(lang: str | None = None) -> dict[str, str]:
@@ -55,6 +61,8 @@ class QuickMenuCallbacks:
     on_quit: Callable[[], None]
     on_copy_last_raw: Callable[[], None] | None = None
     on_toggle_meeting: Callable[[], None] | None = None
+    on_open_history: Callable[[], None] | None = None
+    on_paste_last_dictation: Callable[[], None] | None = None
 
 
 def populate_microphone_menu(
@@ -222,5 +230,84 @@ def build_quick_menu(
     quit_act = QAction(tr("menu.quit", lang), menu)
     quit_act.triggered.connect(callbacks.on_quit)
     menu.addAction(quit_act)
+
+    return menu
+
+
+def build_pill_menu(
+    state: QuickMenuState,
+    callbacks: QuickMenuCallbacks,
+    *,
+    parent: QWidget | None = None,
+    devices: list[AudioDeviceInfo] | None = None,
+    theme: ResolvedTheme = "dark",
+    lang: str | None = None,
+) -> QMenu:
+    """Build the compact Wispr Flow-style popup menu anchored above the Flow Bar."""
+    menu_sheet = build_pill_menu_stylesheet(theme)
+    t = get_theme_tokens(theme)
+    icon_color = t["text"]
+
+    menu = QMenu(parent)
+    menu.setStyleSheet(menu_sheet)
+
+    if state.is_snoozed:
+        hide_act = QAction(render_icon("snooze", icon_color, 16), tr("menu.show_bar_now", lang), menu)
+        hide_act.triggered.connect(callbacks.on_unsnooze)
+    else:
+        hide_act = QAction(render_icon("snooze", icon_color, 16), tr("menu.snooze_1h", lang), menu)
+        hide_act.triggered.connect(callbacks.on_snooze_1h)
+    menu.addAction(hide_act)
+
+    reset_pos_act = QAction(render_icon("history", icon_color, 16), tr("menu.reset_pos", lang), menu)
+    reset_pos_act.triggered.connect(callbacks.on_reset_position)
+    menu.addAction(reset_pos_act)
+
+    settings_act = QAction(render_icon("settings", icon_color, 16), tr("menu.settings", lang), menu)
+    settings_act.triggered.connect(callbacks.on_open_settings)
+    menu.addAction(settings_act)
+
+    quit_act = QAction(render_icon("logout", icon_color, 16), tr("menu.quit", lang), menu)
+    quit_act.triggered.connect(callbacks.on_quit)
+    menu.addAction(quit_act)
+
+    menu.addSeparator()
+
+    mic_menu = QMenu(tr("menu.microphone", lang), menu)
+    mic_menu.setIcon(render_icon("mic", icon_color, 16))
+    mic_menu.setStyleSheet(menu_sheet)
+    populate_microphone_menu(
+        mic_menu,
+        state.selected_mic_index,
+        callbacks.on_select_mic,
+        devices=devices,
+        lang=lang,
+    )
+    menu.addMenu(mic_menu)
+
+    profile_menu = QMenu(tr("menu.vram_mode", lang), menu)
+    profile_menu.setIcon(render_icon("style", icon_color, 16))
+    profile_menu.setStyleSheet(menu_sheet)
+    profile_group = QActionGroup(profile_menu)
+    profile_group.setExclusive(True)
+    for key, label in get_profile_labels(lang).items():
+        act = QAction(label, profile_menu)
+        act.setCheckable(True)
+        act.setChecked(key == state.profile)
+        act.triggered.connect(lambda checked, k=key: checked and callbacks.on_select_profile(k))
+        profile_group.addAction(act)
+        profile_menu.addAction(act)
+    menu.addMenu(profile_menu)
+
+    menu.addSeparator()
+
+    paste_cb = callbacks.on_paste_last_dictation or callbacks.on_copy_last_dictation
+    paste_act = QAction(
+        render_icon("clipboard_paste", icon_color, 16),
+        tr("menu.paste_last", lang),
+        menu,
+    )
+    paste_act.triggered.connect(paste_cb)
+    menu.addAction(paste_act)
 
     return menu

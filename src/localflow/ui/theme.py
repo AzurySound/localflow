@@ -153,6 +153,28 @@ _DARK_TOKENS: dict[str, str] = {
     "scroll_handle": "#52525b",
     "scroll_hover": "#71717a",
     "msgbox_bg": "#18181b",
+    "shell_bg": "#111113",
+    "shell_border": "#2b2b31",
+    "chrome_bg": "#202024",
+    "chrome_hover": "#2b2b31",
+    "close_hover_bg": "#dc2626",
+    "close_hover_fg": "#ffffff",
+    "accent": "#10b981",
+    "accent_hover": "#059669",
+    "danger": "#dc2626",
+    "chip_bg": "#202024",
+    "chip_border": "#2f2f35",
+    "hover_bg": "#2a2a30",
+    "subtle_card_bg": "#1c1c20",
+    "subtle_card_border": "#29292f",
+    "bubble_self_bg": "#2a2038",
+    "bubble_self_interim_bg": "#21192b",
+    "bubble_self_fg": "#f3effa",
+    "bubble_self_interim_fg": "#bfb2d1",
+    "bubble_other_bg": "#20232a",
+    "bubble_other_interim_bg": "#191b21",
+    "bubble_other_fg": "#eceef2",
+    "bubble_other_interim_fg": "#9ca3af",
 }
 
 _LIGHT_TOKENS: dict[str, str] = {
@@ -219,7 +241,34 @@ _LIGHT_TOKENS: dict[str, str] = {
     "scroll_handle": "#a1a1aa",
     "scroll_hover": "#71717a",
     "msgbox_bg": "#ffffff",
+    "shell_bg": "#f2f2f5",
+    "shell_border": "#d4d4d8",
+    "chrome_bg": "#e9e9ee",
+    "chrome_hover": "#dcdce3",
+    "close_hover_bg": "#dc2626",
+    "close_hover_fg": "#ffffff",
+    "accent": "#10b981",
+    "accent_hover": "#059669",
+    "danger": "#dc2626",
+    "chip_bg": "#f4f4f6",
+    "chip_border": "#d4d4d8",
+    "hover_bg": "#e9e9ee",
+    "subtle_card_bg": "#f7f7fa",
+    "subtle_card_border": "#e4e4e9",
+    "bubble_self_bg": "#ede9fe",
+    "bubble_self_interim_bg": "#f5f3ff",
+    "bubble_self_fg": "#2e1065",
+    "bubble_self_interim_fg": "#6d28d9",
+    "bubble_other_bg": "#eceef2",
+    "bubble_other_interim_bg": "#f4f4f6",
+    "bubble_other_fg": "#18181b",
+    "bubble_other_interim_fg": "#6b7280",
 }
+
+
+def get_theme_tokens(theme: ResolvedTheme) -> dict[str, str]:
+    """Return a shallow copy of the unified palette tokens for dark or light mode."""
+    return dict(_LIGHT_TOKENS if theme == "light" else _DARK_TOKENS)
 
 
 def build_hub_stylesheet(theme: ResolvedTheme) -> str:
@@ -232,7 +281,46 @@ QWidget {{
     font-size: 9.5pt;
 }}
 SettingsWindow {{
-    background-color: {t["win_bg"]};
+    background-color: transparent;
+}}
+QFrame#appShell {{
+    background-color: {t["shell_bg"]};
+    border: 1px solid {t["shell_border"]};
+    border-radius: 14px;
+}}
+QFrame#appShell[windowMaximized="true"] {{
+    border: none;
+    border-radius: 0px;
+}}
+QFrame#topTitleBar {{
+    background-color: transparent;
+    border: none;
+}}
+QLabel#windowVersionBadge {{
+    background-color: {t["chip_bg"]};
+    color: {t["text_muted"]};
+    border: 1px solid {t["chip_border"]};
+    border-radius: 5px;
+    padding: 1px 6px;
+    font-size: 7.5pt;
+    font-weight: 600;
+}}
+QPushButton#windowChromeBtn, QPushButton#windowCloseBtn {{
+    background-color: transparent;
+    border: none;
+    border-radius: 7px;
+    color: {t["text_secondary"]};
+}}
+QPushButton#windowChromeBtn:hover {{
+    background-color: {t["chrome_hover"]};
+    color: {t["text_strong"]};
+}}
+QPushButton#windowCloseBtn:hover {{
+    background-color: {t["close_hover_bg"]};
+    color: {t["close_hover_fg"]};
+}}
+QSplitter::handle {{
+    background-color: {t["divider"]};
 }}
 QFrame#sidebar {{
     background-color: {t["win_bg"]};
@@ -394,6 +482,42 @@ QPushButton#dangerBtn:hover {{
 QPushButton#dangerBtn:pressed {{
     background-color: #b91c1c;
 }}
+QPushButton#notetakerStartBtn {{
+    background-color: #7c3aed;
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    padding: 7px 16px;
+    font-weight: 600;
+}}
+QPushButton#notetakerStartBtn:hover {{
+    background-color: #6d28d9;
+}}
+QPushButton#notetakerStartBtn:pressed {{
+    background-color: #5b21b6;
+}}
+QPushButton#notetakerStartBtn:disabled {{
+    background-color: #4c1d95;
+    color: #ddd6fe;
+}}
+QPushButton#notetakerStopBtn {{
+    background-color: #991b1b;
+    color: #fef2f2;
+    border: none;
+    border-radius: 8px;
+    padding: 7px 16px;
+    font-weight: 600;
+}}
+QPushButton#notetakerStopBtn:hover {{
+    background-color: #b91c1c;
+}}
+QPushButton#notetakerStopBtn:pressed {{
+    background-color: #7f1d1d;
+}}
+QPushButton#notetakerStopBtn:disabled {{
+    background-color: #7f1d1d;
+    color: #fca5a5;
+}}
 QMessageBox {{
     background-color: {t["msgbox_bg"]};
 }}
@@ -458,20 +582,6 @@ QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
 QCheckBox {{
     spacing: 8px;
     color: {t["text"]};
-}}
-QCheckBox::indicator {{
-    width: 16px;
-    height: 16px;
-    border-radius: 5px;
-    border: 1.5px solid {t["check_border"]};
-    background-color: {t["check_bg"]};
-}}
-QCheckBox::indicator:hover {{
-    border-color: {t["check_hover"]};
-}}
-QCheckBox::indicator:checked {{
-    background-color: #10b981;
-    border: 3px solid {t["check_bg"]};
 }}
 QListWidget#historyList {{
     background-color: transparent;
@@ -555,59 +665,120 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
 """
 
 
-def build_menu_stylesheet(theme: ResolvedTheme) -> str:
-    if theme == "light":
-        return """
-QMenu {
-    background-color: #ffffff;
-    color: #18181b;
-    border: 1px solid #d4d4d8;
-    border-radius: 8px;
-    padding: 5px;
+def build_dialog_stylesheet(theme: ResolvedTheme) -> str:
+    """Unified dark/light stylesheet for QMessageBox and QInputDialog popups."""
+    t = _LIGHT_TOKENS if theme == "light" else _DARK_TOKENS
+    return f"""
+QMessageBox, QInputDialog {{
+    background-color: {t["msgbox_bg"]};
+    color: {t["text"]};
     font-family: 'Segoe UI';
-    font-size: 9pt;
-}
-QMenu::item {
-    padding: 6px 24px 6px 24px;
-    border-radius: 5px;
-}
-QMenu::item:selected {
-    background-color: #2563eb;
+    font-size: 9.5pt;
+}}
+QMessageBox QLabel, QInputDialog QLabel {{
+    color: {t["text"]};
+    background-color: transparent;
+}}
+QInputDialog QLineEdit {{
+    background-color: {t["input_bg"]};
+    border: 1px solid {t["input_border"]};
+    border-radius: 7px;
+    padding: 6px 9px;
+    color: {t["input_fg"]};
+}}
+QInputDialog QLineEdit:focus {{
+    border-color: {t["input_focus"]};
+}}
+QMessageBox QPushButton, QInputDialog QPushButton {{
+    background-color: {t["secondary_bg"]};
+    color: {t["secondary_fg"]};
+    border: 1px solid {t["secondary_border"]};
+    border-radius: 7px;
+    padding: 5px 14px;
+    min-width: 72px;
+    font-weight: 500;
+}}
+QMessageBox QPushButton:hover, QInputDialog QPushButton:hover {{
+    background-color: {t["secondary_hover_bg"]};
+    border-color: {t["secondary_hover_border"]};
+}}
+QMessageBox QPushButton#dangerBtn {{
+    background-color: #dc2626;
     color: #ffffff;
-}
-QMenu::item:disabled {
-    color: #71717a;
-}
-QMenu::separator {
-    height: 1px;
-    background: #e4e4e7;
-    margin: 4px 8px;
-}
+    border: none;
+    font-weight: 600;
+}}
+QMessageBox QPushButton#dangerBtn:hover {{
+    background-color: #ef4444;
+}}
 """
-    return """
-QMenu {
-    background-color: #14171f;
-    color: #e5e7eb;
-    border: 1px solid #2a2f3d;
-    border-radius: 8px;
+
+
+def build_menu_stylesheet(theme: ResolvedTheme) -> str:
+    t = _LIGHT_TOKENS if theme == "light" else _DARK_TOKENS
+    return f"""
+QMenu {{
+    background-color: {t["popup_bg"]};
+    color: {t["text"]};
+    border: 1px solid {t["popup_border"]};
+    border-radius: 9px;
     padding: 5px;
     font-family: 'Segoe UI';
     font-size: 9pt;
-}
-QMenu::item {
+}}
+QMenu::item {{
     padding: 6px 24px 6px 24px;
-    border-radius: 5px;
-}
-QMenu::item:selected {
-    background-color: #2563eb;
-    color: #ffffff;
-}
-QMenu::item:disabled {
-    color: #9ca3af;
-}
-QMenu::separator {
+    border-radius: 6px;
+}}
+QMenu::item:selected {{
+    background-color: {t["popup_sel"]};
+    color: {t["text_strong"]};
+}}
+QMenu::item:disabled {{
+    color: {t["text_muted"]};
+}}
+QMenu::separator {{
     height: 1px;
-    background: #262b38;
+    background: {t["divider"]};
     margin: 4px 8px;
-}
+}}
+"""
+
+
+def build_pill_menu_stylesheet(theme: ResolvedTheme) -> str:
+    """Wispr Flow-inspired dark/light floating card stylesheet for the Flow Bar popup menu."""
+    t = _LIGHT_TOKENS if theme == "light" else _DARK_TOKENS
+    bg = "#ffffff" if theme == "light" else "#141417"
+    border = "#d4d4d8" if theme == "light" else "#26262b"
+    sep = "#e4e4e7" if theme == "light" else "#232328"
+    return f"""
+QMenu {{
+    background-color: {bg};
+    color: {t["text"]};
+    border: 1px solid {border};
+    border-radius: 14px;
+    padding: 8px;
+    min-width: 232px;
+    font-family: 'Segoe UI';
+    font-size: 9.5pt;
+}}
+QMenu::icon {{
+    padding-left: 8px;
+}}
+QMenu::item {{
+    padding: 9px 14px 9px 12px;
+    border-radius: 8px;
+}}
+QMenu::item:selected {{
+    background-color: {t["popup_sel"]};
+    color: {t["text_strong"]};
+}}
+QMenu::item:disabled {{
+    color: {t["text_muted"]};
+}}
+QMenu::separator {{
+    height: 1px;
+    background: {sep};
+    margin: 6px 10px;
+}}
 """

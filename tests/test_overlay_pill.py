@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QApplication
 
 from localflow.ui.overlay_pill import (
     COMPACT_WIDTH,
+    HOVER_RIGHT_EXTRA,
     HOVER_WIDTH,
     IDLE_HITBOX_HEIGHT,
     IDLE_HITBOX_WIDTH,
@@ -442,7 +443,7 @@ def test_mid_drag_compact_to_notice_transition_preserves_anchor_and_drag(make_pi
     assert emitted == [(expected.x(), expected.y())]
 
 
-def test_idle_bar_geometry_and_hover_expansion(make_pill) -> None:
+def test_idle_bar_geometry_and_hover_expansion(make_pill, monkeypatch) -> None:
     geo = _screen_geo()
     cx = geo.x() + geo.width() // 2 - COMPACT_WIDTH // 2
     cy = geo.y() + geo.height() // 2
@@ -456,7 +457,7 @@ def test_idle_bar_geometry_and_hover_expansion(make_pill) -> None:
     assert pill.y() == cy + PILL_HEIGHT - IDLE_HITBOX_HEIGHT
 
     # Simulate hover enter and advance animation frames to full expansion
-    from PySide6.QtGui import QEnterEvent
+    from PySide6.QtGui import QCursor, QEnterEvent
 
     pill.enterEvent(QEnterEvent(QPointF(10.0, 5.0), QPointF(10.0, 5.0), QPointF(10.0, 5.0)))
     for _ in range(10):
@@ -466,7 +467,7 @@ def test_idle_bar_geometry_and_hover_expansion(make_pill) -> None:
     assert pill.height() == PILL_HEIGHT
     assert pill.y() == cy
 
-    # Render expanded hover state
+    # Render expanded hover state (including 1/255 alpha hit-test bridge across gap)
     pix = QPixmap(pill.size())
     pix.fill(Qt.GlobalColor.transparent)
     pill.render(pix)
@@ -474,9 +475,12 @@ def test_idle_bar_geometry_and_hover_expansion(make_pill) -> None:
         pix.toImage().pixelColor(x, PILL_HEIGHT // 2).alpha() > 0 for x in range(pill.width())
     )
 
-    # Collapse back to thin resting bar
+    assert pill._leave_timer.interval() == 260
+
+    # Ensure cursor is treated as outside when testing collapse
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: QPoint(-1000, -1000)))
     pill._collapse_idle_hover()
-    for _ in range(12):
+    for _ in range(22):
         pill._on_tick()
     assert pill._hover_progress == pytest.approx(0.0)
     assert pill.width() == IDLE_HITBOX_WIDTH
@@ -548,22 +552,36 @@ def test_right_click_emits_context_menu_signal(make_pill) -> None:
     assert received == [global_pos]
 
 
-def test_idle_hover_copy_mini_pill_emits_copy_last_without_toggling(make_pill) -> None:
+def test_idle_hover_dual_capsule_zones_tooltip_and_signals(make_pill) -> None:
     from PySide6.QtGui import QEnterEvent
 
     pill = make_pill()
-    pill.set_has_last_dictation(True)
+    pill.set_idle_hint("2× CapsLock")
     pill.show_idle_bar()
 
     pill.enterEvent(QEnterEvent(QPointF(10.0, 5.0), QPointF(10.0, 5.0), QPointF(10.0, 5.0)))
     for _ in range(10):
         pill._on_tick()
     assert pill.width() == HOVER_WIDTH
+    assert pill._right_expand_progress == pytest.approx(0.0)
 
-    copied: list[bool] = []
+    meetings: list[bool] = []
+    menus: list[QPoint] = []
     toggled: list[bool] = []
-    pill.copy_last_requested.connect(lambda: copied.append(True))
+    pill.meeting_clicked.connect(lambda: meetings.append(True))
+    pill.context_menu_requested.connect(menus.append)
     pill.toggle_requested.connect(lambda: toggled.append(True))
+
+    def _move(local_pt: QPointF) -> None:
+        mv = QMouseEvent(
+            QEvent.Type.MouseMove,
+            local_pt,
+            QPointF(pill.mapToGlobal(local_pt.toPoint())),
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(pill, mv)
 
     def _click(local_pt: QPointF) -> None:
         g = QPointF(pill.mapToGlobal(local_pt.toPoint()))
@@ -576,24 +594,159 @@ def test_idle_hover_copy_mini_pill_emits_copy_last_without_toggling(make_pill) -
             )
             QApplication.sendEvent(pill, ev)
 
-    # Hover & click inside the right-hand copy mini-pill
-    copy_center = pill._copy_button_rect().center()
-    move_ev = QMouseEvent(
+    # Hovering mic stays in two-button state (chevron hidden) and triggers dictate
+    mic_center = pill._mic_button_rect().center()
+    _move(mic_center)
+    for _ in range(8):
+        pill._on_tick()
+    assert pill._idle_hover_zone == "mic"
+    assert pill.width() == HOVER_WIDTH
+    assert pill._right_expand_progress == pytest.approx(0.0)
+    assert pill._tooltip_popup.isVisible()
+    assert pill._tooltip_popup._text == "Dictate"
+    assert pill._tooltip_popup._bold_suffix == "2× CapsLock"
+    _click(mic_center)
+    assert len(toggled) == 1
+
+    # Moving onto right Notetaker button smoothly expands capsule to reveal chevron
+    nt_center = pill._notetaker_button_rect().center()
+    _move(nt_center)
+    for _ in range(18):
+        pill._on_tick()
+    assert pill._idle_hover_zone == "notetaker"
+    assert pill._right_expand_progress == pytest.approx(1.0)
+    assert pill.width() == HOVER_WIDTH + HOVER_RIGHT_EXTRA
+    assert pill._tooltip_popup._text == "Start Notetaker"
+    _click(nt_center)
+    assert len(meetings) == 1
+    assert len(toggled) == 1
+
+    # Hover & click Menu chevron revealed on the right
+    menu_center = pill._menu_button_rect().center()
+    _move(menu_center)
+    assert pill._idle_hover_zone == "menu"
+    assert pill._tooltip_popup._text == "Menu"
+    _click(menu_center)
+    assert len(menus) == 1
+    assert len(toggled) == 1
+    assert not pill._tooltip_popup.isVisible()
+
+    # Returning to mic capsule smoothly collapses chevron back to two concise buttons
+    _move(mic_center)
+    for _ in range(22):
+        pill._on_tick()
+    assert pill._right_expand_progress == pytest.approx(0.0)
+    assert pill.width() == HOVER_WIDTH
+
+    pill.hide_pill()
+    assert not pill._tooltip_popup.isVisible()
+
+
+def test_idle_hover_gap_keeps_pill_open_and_fast_hide_outside(make_pill, monkeypatch) -> None:
+    from PySide6.QtGui import QCursor, QEnterEvent
+
+    pill = make_pill()
+    pill.show_idle_bar()
+    pill.enterEvent(QEnterEvent(QPointF(10.0, 5.0), QPointF(10.0, 5.0), QPointF(10.0, 5.0)))
+    for _ in range(10):
+        pill._on_tick()
+    assert pill._hover_progress == pytest.approx(1.0)
+
+    gap_x = (pill._mic_button_rect().right() + pill._notetaker_button_rect().left()) / 2.0
+    gap_local = QPointF(gap_x, pill.height() / 2.0)
+
+    # Painted image has non-zero alpha inside the 4px gap so Windows layered hit-testing stays solid
+    pix = QPixmap(pill.size())
+    pix.fill(Qt.GlobalColor.transparent)
+    pill.render(pix)
+    assert pix.toImage().pixelColor(int(round(gap_x)), int(round(gap_local.y()))).alpha() > 0
+
+    # Moving across the gap keeps _hovered True and stops _leave_timer
+    mv = QMouseEvent(
         QEvent.Type.MouseMove,
-        copy_center,
-        QPointF(pill.mapToGlobal(copy_center.toPoint())),
+        gap_local,
+        QPointF(pill.mapToGlobal(gap_local.toPoint())),
         Qt.MouseButton.NoButton,
         Qt.MouseButton.NoButton,
         Qt.KeyboardModifier.NoModifier,
     )
-    QApplication.sendEvent(pill, move_ev)
-    assert pill._copy_hovered is True
+    pill._leave_timer.start()
+    QApplication.sendEvent(pill, mv)
+    assert pill._hovered is True
+    assert not pill._leave_timer.isActive()
 
-    _click(copy_center)
-    assert len(copied) == 1
-    assert len(toggled) == 0
+    # Even if leaveEvent / _collapse_idle_hover triggers while cursor is in the gap, pill stays open
+    gap_global = pill.mapToGlobal(gap_local.toPoint())
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: gap_global))
+    pill.leaveEvent(QEvent(QEvent.Type.Leave))
+    assert pill._hovered is True
+    assert not pill._leave_timer.isActive()
+    pill._collapse_idle_hover()
+    assert pill._hovered is True
+    assert pill.width() == HOVER_WIDTH
 
-    # Click on the left/main area of the expanded hover bar still toggles dictation
-    _click(QPointF(40.0, PILL_HEIGHT / 2.0))
-    assert len(copied) == 1
-    assert len(toggled) == 1
+    # Once cursor genuinely leaves the pill bounds, fast 260ms collapse starts and shrinks back
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: QPoint(-1000, -1000)))
+    pill.leaveEvent(QEvent(QEvent.Type.Leave))
+    assert pill._leave_timer.isActive()
+    assert pill._leave_timer.interval() == 260
+    pill._collapse_idle_hover()
+    for _ in range(10):
+        pill._on_tick()
+    assert pill._hover_progress == pytest.approx(0.0)
+    assert pill.width() == IDLE_HITBOX_WIDTH
+    assert not pill._hover_watch_timer.isActive()
+
+
+def test_idle_hover_collapses_when_cursor_exits_upward_or_rightward_after_swallowed_leave(
+    make_pill, monkeypatch
+) -> None:
+    from PySide6.QtGui import QCursor, QEnterEvent
+
+    pill = make_pill()
+    assert pill._tooltip_popup.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+    assert bool(pill._tooltip_popup.windowFlags() & Qt.WindowType.WindowTransparentForInput)
+
+    pill.show_idle_bar()
+    inside_global = pill.mapToGlobal(QPoint(10, pill.height() // 2))
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: inside_global))
+    pill.enterEvent(QEnterEvent(QPointF(10.0, 5.0), QPointF(10.0, 5.0), QPointF(10.0, 5.0)))
+    for _ in range(10):
+        pill._on_tick()
+    assert pill._hovered is True
+    assert pill._hover_watch_timer.isActive()
+
+    # Simulate a swallowed leaveEvent when Windows disarms one-shot TME_LEAVE on edge/right move
+    pill.leaveEvent(QEvent(QEvent.Type.Leave))
+    assert pill._hovered is True
+    assert not pill._leave_timer.isActive()
+
+    # Cursor moves UP above the pill (over tooltip area) without another OS leaveEvent:
+    # _check_idle_hover_cursor detects cursor outside frameGeometry and schedules collapse.
+    above_global = QPoint(pill.frameGeometry().center().x(), pill.frameGeometry().top() - 18)
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: above_global))
+    pill._check_idle_hover_cursor()
+    assert pill._leave_timer.isActive()
+    assert not pill._tooltip_popup.isVisible()
+    pill._collapse_idle_hover()
+    assert pill._hovered is False
+    assert not pill._hover_watch_timer.isActive()
+
+    # Re-enter and check moving RIGHT outside expanded pill
+    inside_global = pill.mapToGlobal(QPoint(pill.width() - 4, pill.height() // 2))
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: inside_global))
+    pill.enterEvent(QEnterEvent(QPointF(10.0, 5.0), QPointF(10.0, 5.0), QPointF(10.0, 5.0)))
+    for _ in range(10):
+        pill._on_tick()
+    assert pill._hover_watch_timer.isActive()
+
+    right_outside = QPoint(pill.frameGeometry().right() + 25, pill.frameGeometry().center().y())
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: right_outside))
+    pill._check_idle_hover_cursor()
+    assert pill._leave_timer.isActive()
+    pill._collapse_idle_hover()
+    for _ in range(10):
+        pill._on_tick()
+    assert pill._hover_progress == pytest.approx(0.0)
+    assert pill.width() == IDLE_HITBOX_WIDTH
+    assert not pill._hover_watch_timer.isActive()

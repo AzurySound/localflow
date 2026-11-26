@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from typing import Callable
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -26,8 +25,10 @@ from localflow.notetaker.storage import (
     MeetingUtterance,
     format_timestamp,
 )
+from localflow.ui.icons import render_icon
 from localflow.ui.meeting_window import MeetingNoteWorkspace
-from localflow.ui.theme import ResolvedTheme
+from localflow.ui.theme import ResolvedTheme, get_theme_tokens
+from localflow.ui.widgets import DropdownCombo
 
 
 class NotetakerPage(QWidget):
@@ -102,17 +103,42 @@ class NotetakerPage(QWidget):
     def set_theme(self, theme: ResolvedTheme) -> None:
         self._theme = theme
         self._workspace.set_theme(theme)
+        self._refresh_button_icons()
+        self._mode_combo.update()
 
     def retranslate(self, lang: str) -> None:
         self._lang = normalize_language(lang)
         self._update_record_button_text()
         self._mode_combo.setItemText(0, tr("notetaker.mode.dual", self._lang))
         self._mode_combo.setItemText(1, tr("notetaker.mode.mic_only", self._lang))
-        self._popout_btn.setText(f"↗ {tr('notetaker.btn.popout', self._lang)}")
+        self._popout_btn.setText(tr("notetaker.btn.popout", self._lang))
         self._export_btn.setText(tr("notetaker.btn.export", self._lang))
-        self._delete_btn.setText(tr("notetaker.btn.delete", self._lang))
+        self._delete_btn.setText("")
+        self._delete_btn.setToolTip(tr("notetaker.btn.delete", self._lang))
         self._search_edit.setPlaceholderText(tr("notetaker.search_placeholder", self._lang))
+        self._refresh_button_icons()
         self._workspace.retranslate(self._lang)
+
+    def _refresh_button_icons(self) -> None:
+        t = get_theme_tokens(self._theme)
+        self._popout_btn.setIcon(render_icon("popout", t["secondary_fg"], 13))
+        self._export_btn.setIcon(render_icon("export", t["secondary_fg"], 13))
+        self._delete_btn.setIcon(render_icon("trash", t["ghost_fg"], 13))
+        self._refresh_record_button_style()
+
+    def _refresh_record_button_style(self) -> None:
+        if self._is_recording:
+            if self._record_btn.objectName() != "notetakerStopBtn":
+                self._record_btn.setObjectName("notetakerStopBtn")
+                self._record_btn.style().unpolish(self._record_btn)
+                self._record_btn.style().polish(self._record_btn)
+            self._record_btn.setIcon(render_icon("stop_square", "#fef2f2", 13))
+        else:
+            if self._record_btn.objectName() != "notetakerStartBtn":
+                self._record_btn.setObjectName("notetakerStartBtn")
+                self._record_btn.style().unpolish(self._record_btn)
+                self._record_btn.style().polish(self._record_btn)
+            self._record_btn.setIcon(render_icon("record_dot", "#ffffff", 13))
 
     def _build_ui(self, llm_factory: Callable[[], object | None] | None) -> None:
         root = QHBoxLayout(self)
@@ -126,29 +152,38 @@ class NotetakerPage(QWidget):
         # Left sidebar
         left = QFrame()
         left.setObjectName("NotetakerSidebar")
-        left.setMinimumWidth(240)
-        left.setMaximumWidth(300)
+        left.setMinimumWidth(265)
+        left.setMaximumWidth(315)
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(14, 14, 14, 14)
         left_lay.setSpacing(9)
 
         self._record_btn = QPushButton()
+        self._record_btn.setObjectName("notetakerStartBtn")
         self._record_btn.setMinimumHeight(36)
+        self._record_btn.setIconSize(QSize(13, 13))
         self._record_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         left_lay.addWidget(self._record_btn)
 
-        self._mode_combo = QComboBox()
+        self._mode_combo = DropdownCombo()
         self._mode_combo.addItem("Call (Mic + System Audio)", "dual")
         self._mode_combo.addItem("Offline (Mic Only)", "mic_only")
         left_lay.addWidget(self._mode_combo)
 
         util_row = QHBoxLayout()
         util_row.setSpacing(6)
-        self._popout_btn = QPushButton("↗ Side Window")
+        self._popout_btn = QPushButton("Side Window")
+        self._popout_btn.setObjectName("secondary")
+        self._popout_btn.setIconSize(QSize(13, 13))
         self._popout_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._export_btn = QPushButton("Export")
+        self._export_btn.setObjectName("secondary")
+        self._export_btn.setIconSize(QSize(13, 13))
         self._export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._delete_btn = QPushButton("Delete")
+        self._delete_btn = QPushButton()
+        self._delete_btn.setObjectName("ghostBtn")
+        self._delete_btn.setFixedSize(32, 30)
+        self._delete_btn.setIconSize(QSize(14, 14))
         self._delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         util_row.addWidget(self._popout_btn, 1)
         util_row.addWidget(self._export_btn)
@@ -162,7 +197,7 @@ class NotetakerPage(QWidget):
         left_lay.addWidget(self._search_edit)
 
         self._meeting_list = QListWidget()
-        self._meeting_list.setObjectName("HistoryList")
+        self._meeting_list.setObjectName("historyList")
         self._meeting_list.setSpacing(4)
         left_lay.addWidget(self._meeting_list, 1)
 
@@ -256,13 +291,10 @@ class NotetakerPage(QWidget):
     def _update_record_button_text(self) -> None:
         if self._is_recording:
             elapsed = self._level_provider()[2] if self._level_provider is not None else 0.0
-            self._record_btn.setText(f"■ {tr('notetaker.btn.stop', self._lang)} ({format_timestamp(elapsed)})")
-            self._record_btn.setStyleSheet(
-                "background-color: #dc2626; color: #ffffff; font-weight: 600; border-radius: 8px; padding: 6px 12px;"
-            )
+            self._record_btn.setText(f"{tr('notetaker.btn.stop', self._lang)} ({format_timestamp(elapsed)})")
         else:
-            self._record_btn.setText(f"● {tr('notetaker.btn.start', self._lang)}")
-            self._record_btn.setStyleSheet("")
+            self._record_btn.setText(tr("notetaker.btn.start", self._lang))
+        self._refresh_record_button_style()
 
     def _update_util_buttons(self) -> None:
         mid = self._workspace.current_meeting_id

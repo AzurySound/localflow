@@ -59,10 +59,14 @@ def test_theme_resolution_and_stylesheets(monkeypatch) -> None:
     assert resolve_theme("system") == "dark"
     assert resolve_theme("light") == "light"
 
+    from localflow.ui.theme import build_dialog_stylesheet
+
     assert "#f2f2f5" in build_hub_stylesheet("light")
     assert "#111113" in build_hub_stylesheet("dark")
     assert "#ffffff" in build_menu_stylesheet("light")
-    assert "#14171f" in build_menu_stylesheet("dark")
+    assert "#18181b" in build_menu_stylesheet("dark")
+    assert "#18181b" in build_dialog_stylesheet("dark")
+    assert "#ffffff" in build_dialog_stylesheet("light")
 
 
 def test_settings_window_theme_switch_roundtrip_and_sound_test_button(
