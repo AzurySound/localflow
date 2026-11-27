@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 import logging
 import math
+import sys
 import threading
 import time
 from typing import Literal
+import uuid
 
 import numpy as np
 import sounddevice as sd
@@ -20,6 +24,106 @@ logger = logging.getLogger("localflow.loopback")
 
 AudioChannel = Literal["mic", "system"]
 AudioMode = Literal["dual", "mic_only"]
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+    @classmethod
+    def from_str(cls, raw: str) -> "_GUID":
+        return cls.from_buffer_copy(uuid.UUID(raw).bytes_le)
+
+
+_CLSID_MMDEVICE_ENUMERATOR = _GUID.from_str("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
+_IID_IMMDEVICE_ENUMERATOR = _GUID.from_str("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+
+
+def get_default_render_endpoint_id() -> str | None:
+    """Return the active Windows default multimedia render endpoint ID, or None if unavailable."""
+    if sys.platform != "win32":
+        return None
+    try:
+        ole32 = ctypes.windll.ole32
+        hr_init = int(ole32.CoInitializeEx(None, 0x0)) & 0xFFFFFFFF  # COINIT_MULTITHREADED
+        if hr_init in (0, 1):  # S_OK / S_FALSE
+            should_uninit = True
+        elif hr_init == 0x80010106:  # RPC_E_CHANGED_MODE
+            should_uninit = False
+        else:
+            return None
+
+        try:
+            enumerator = ctypes.c_void_p()
+            hr = (
+                int(
+                    ole32.CoCreateInstance(
+                        ctypes.byref(_CLSID_MMDEVICE_ENUMERATOR),
+                        None,
+                        23,  # CLSCTX_ALL
+                        ctypes.byref(_IID_IMMDEVICE_ENUMERATOR),
+                        ctypes.byref(enumerator),
+                    )
+                )
+                & 0xFFFFFFFF
+            )
+            if hr >= 0x80000000 or not enumerator.value:
+                return None
+
+            enum_vtbl = ctypes.cast(
+                ctypes.cast(enumerator, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            release_enum = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(enum_vtbl[2])
+            get_default = ctypes.WINFUNCTYPE(
+                ctypes.c_long,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_void_p),
+            )(enum_vtbl[4])
+
+            try:
+                dev = ctypes.c_void_p()
+                hr_dev = int(get_default(enumerator, 0, 1, ctypes.byref(dev)))  # eRender=0, eMultimedia=1
+                if hr_dev < 0 or not dev.value:
+                    return None
+
+                dev_vtbl = ctypes.cast(
+                    ctypes.cast(dev, ctypes.POINTER(ctypes.c_void_p))[0],
+                    ctypes.POINTER(ctypes.c_void_p),
+                )
+                release_dev = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(dev_vtbl[2])
+                get_id = ctypes.WINFUNCTYPE(
+                    ctypes.c_long,
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_wchar_p),
+                )(dev_vtbl[5])
+
+                try:
+                    pid = ctypes.c_wchar_p()
+                    hr_id = int(get_id(dev, ctypes.byref(pid)))
+                    try:
+                        if hr_id >= 0 and pid.value:
+                            return str(pid.value)
+                        return None
+                    finally:
+                        ptr = ctypes.cast(pid, ctypes.c_void_p)
+                        if ptr.value:
+                            ole32.CoTaskMemFree(ptr)
+                finally:
+                    release_dev(dev)
+            finally:
+                release_enum(enumerator)
+        finally:
+            if should_uninit:
+                ole32.CoUninitialize()
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,11 +242,28 @@ class MeetingAudioRecorder:
         self._started_at: float = 0.0
         self._time_offset_sec: float = 0.0
 
+        self._requested_mic_index: int | None = None
+        self._requested_loopback_index: int | None = None
+        self._requested_loopback_name: str | None = None
+        self._pause_ms: int = 500
+        self._active_render_endpoint_id: str | None = None
+
         self._mic_stream: sd.InputStream | None = None
         self._pa = None
         self._loopback_stream = None
         self._loopback_rate: int = 48000
         self._loopback_channels: int = 2
+        self._loopback_started_at: float = 0.0
+        self._last_loopback_callback_at: float = 0.0
+        self._last_mic_callback_at: float = 0.0
+        self._mic_callbacks_seen: int = 0
+        self._last_cb_error_log_at: float = 0.0
+
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_interval_sec: float = 2.0
+        self._loopback_stall_timeout_sec: float = 4.5
+        self._mic_stall_timeout_sec: float = 6.0
 
         self._mic_segmenter: SpeechSegmenter | None = None
         self._sys_segmenter: SpeechSegmenter | None = None
@@ -162,10 +283,18 @@ class MeetingAudioRecorder:
         self._tap_active = False
         self._tap_chunks: list[np.ndarray] = []
         self._tap_callback: Callable[[np.ndarray], None] | None = None
+        self._tap_cooldown_until: float = 0.0
+        self._tap_post_cooldown_sec: float = 0.30
+        self._tap_reset_mic_segmenter: bool = False
 
     @property
     def is_recording(self) -> bool:
         return self._recording
+
+    @property
+    def is_dictation_tap_active(self) -> bool:
+        with self._tap_lock:
+            return self._tap_active
 
     @property
     def audio_mode(self) -> AudioMode:
@@ -185,18 +314,50 @@ class MeetingAudioRecorder:
             return self._time_offset_sec
         return self._time_offset_sec + max(0.0, time.monotonic() - self._started_at)
 
+    def _make_mic_segmenter(self, pause_ms: int) -> SpeechSegmenter:
+        return SpeechSegmenter(
+            sample_rate=self.sample_rate,
+            speech_rms_threshold=0.0045,
+            silence_rms_threshold=0.0032,
+            pause_ms=pause_ms,
+            min_segment_speech_ms=280,
+            max_segment_sec=25.0,
+            max_idle_preroll_ms=400,
+        )
+
+    def _make_sys_segmenter(self, pause_ms: int) -> SpeechSegmenter:
+        return SpeechSegmenter(
+            sample_rate=self.sample_rate,
+            speech_rms_threshold=0.004,
+            silence_rms_threshold=0.0028,
+            pause_ms=pause_ms,
+            min_segment_speech_ms=280,
+            max_segment_sec=25.0,
+            max_idle_preroll_ms=400,
+        )
+
     def start_dictation_tap(self, on_block: Callable[[np.ndarray], None] | None = None) -> None:
-        """Start teeing microphone blocks for parallel dictation without closing the meeting stream."""
+        """Start teeing microphone blocks solely to dictation without leaking into the meeting."""
         with self._tap_lock:
             self._tap_chunks = []
             self._tap_callback = on_block
             self._tap_active = True
+            self._tap_reset_mic_segmenter = True
+            self._tap_cooldown_until = 0.0
+        preview_cb = self._on_preview
+        if preview_cb is not None:
+            try:
+                preview_cb("mic", np.zeros(0, dtype=np.float32))
+            except Exception:
+                pass
 
     def stop_dictation_tap(self) -> np.ndarray:
         """Stop parallel dictation tap and return collected 16 kHz mono float32 audio."""
         with self._tap_lock:
             self._tap_active = False
             self._tap_callback = None
+            self._tap_reset_mic_segmenter = True
+            self._tap_cooldown_until = time.monotonic() + self._tap_post_cooldown_sec
             chunks = self._tap_chunks
             self._tap_chunks = []
         if not chunks:
@@ -219,6 +380,11 @@ class MeetingAudioRecorder:
             if self._recording:
                 return
             self._audio_mode = audio_mode
+            self._requested_mic_index = mic_device_index
+            self._requested_loopback_index = loopback_device_index
+            self._requested_loopback_name = None
+            self._pause_ms = pause_ms
+            self._active_render_endpoint_id = None
             self._time_offset_sec = max(0.0, float(time_offset_sec))
             self._on_segment = on_segment
             self._on_preview = on_preview
@@ -228,37 +394,19 @@ class MeetingAudioRecorder:
             self._started_at = time.monotonic()
             self._last_mic_preview_at = 0.0
             self._last_sys_preview_at = 0.0
+            self._mic_callbacks_seen = 0
+            self._last_loopback_callback_at = 0.0
 
-            self._mic_segmenter = SpeechSegmenter(
-                sample_rate=self.sample_rate,
-                speech_rms_threshold=0.0045,
-                silence_rms_threshold=0.0032,
-                pause_ms=pause_ms,
-                min_segment_speech_ms=280,
-            )
+            self._mic_segmenter = self._make_mic_segmenter(pause_ms)
             self._sys_segmenter = (
-                SpeechSegmenter(
-                    sample_rate=self.sample_rate,
-                    speech_rms_threshold=0.004,
-                    silence_rms_threshold=0.0028,
-                    pause_ms=pause_ms,
-                    min_segment_speech_ms=280,
-                )
+                self._make_sys_segmenter(pause_ms)
                 if audio_mode == "dual"
                 else None
             )
             self._recording = True
 
             try:
-                self._mic_stream = sd.InputStream(
-                    samplerate=self.sample_rate,
-                    channels=CHANNELS,
-                    dtype="float32",
-                    blocksize=BLOCK_SIZE,
-                    device=mic_device_index,
-                    callback=self._on_mic_audio,
-                )
-                self._mic_stream.start()
+                self._open_mic_locked(mic_device_index)
             except Exception:
                 self._recording = False
                 self._cleanup_streams_locked()
@@ -269,10 +417,31 @@ class MeetingAudioRecorder:
                     self._start_loopback_locked(loopback_device_index)
                 except Exception as exc:
                     logger.warning("WASAPI Loopback failed to start, continuing mic_only: %s", exc)
+                    self._close_loopback_locked()
                     self._audio_mode = "mic_only"
                     self._sys_segmenter = None
                     if on_error is not None:
                         on_error(f"System audio loopback unavailable: {exc}")
+
+            self._watchdog_stop.clear()
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop,
+                name="LocalFlow-AudioWatchdog",
+                daemon=True,
+            )
+            self._watchdog_thread.start()
+
+    def _open_mic_locked(self, mic_device_index: int | None) -> None:
+        self._mic_stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=CHANNELS,
+            dtype="float32",
+            blocksize=BLOCK_SIZE,
+            device=mic_device_index,
+            callback=self._on_mic_audio,
+        )
+        self._mic_stream.start()
+        self._last_mic_callback_at = time.monotonic()
 
     def _start_loopback_locked(self, loopback_device_index: int | None) -> None:
         import pyaudiowpatch as pyaudio
@@ -280,7 +449,24 @@ class MeetingAudioRecorder:
         pa = pyaudio.PyAudio()
         self._pa = pa
         target_info = None
-        if loopback_device_index is not None:
+
+        if loopback_device_index is not None and self._requested_loopback_name:
+            try:
+                for idx in range(pa.get_device_count()):
+                    try:
+                        info = pa.get_device_info_by_index(idx)
+                    except Exception:
+                        continue
+                    if (
+                        info.get("isLoopbackDevice", False)
+                        and str(info.get("name", "")) == self._requested_loopback_name
+                    ):
+                        target_info = info
+                        break
+            except Exception:
+                target_info = None
+
+        if target_info is None and loopback_device_index is not None:
             try:
                 info = pa.get_device_info_by_index(loopback_device_index)
                 if info.get("isLoopbackDevice", False):
@@ -291,6 +477,12 @@ class MeetingAudioRecorder:
         if target_info is None:
             target_info = pa.get_default_wasapi_loopback()
 
+        if not isinstance(target_info, dict) or "index" not in target_info:
+            raise RuntimeError("No WASAPI loopback device available")
+
+        if loopback_device_index is not None:
+            self._requested_loopback_name = str(target_info.get("name", ""))
+        self._active_render_endpoint_id = get_default_render_endpoint_id()
         self._loopback_rate = max(8000, int(round(float(target_info.get("defaultSampleRate", 48000)))))
         self._loopback_channels = max(1, int(target_info.get("maxInputChannels", 2)))
         frames_per_buffer = max(256, int(round(self._loopback_rate * 0.032)))
@@ -305,6 +497,98 @@ class MeetingAudioRecorder:
             stream_callback=self._on_loopback_audio,
         )
         self._loopback_stream.start_stream()
+        now = time.monotonic()
+        self._loopback_started_at = now
+        self._last_loopback_callback_at = now
+        logger.info(
+            "WASAPI loopback active on %r (%d Hz, %d ch)",
+            target_info.get("name", "?"),
+            self._loopback_rate,
+            self._loopback_channels,
+        )
+
+    @staticmethod
+    def _is_loopback_stream_active(stream) -> bool:
+        try:
+            return bool(stream.is_active())
+        except Exception:
+            return False
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.wait(timeout=self._watchdog_interval_sec):
+            if not self._recording:
+                break
+
+            if self._audio_mode == "dual":
+                now = time.monotonic()
+                stream = self._loopback_stream
+                reason: str | None = None
+                if stream is None:
+                    reason = "stream_missing"
+                elif not self._is_loopback_stream_active(stream):
+                    reason = "stream_inactive"
+                elif now - self._last_loopback_callback_at > self._loopback_stall_timeout_sec:
+                    reason = "callback_stalled"
+                elif self._requested_loopback_index is None:
+                    cur_ep = get_default_render_endpoint_id()
+                    if (
+                        cur_ep is not None
+                        and self._active_render_endpoint_id is not None
+                        and cur_ep != self._active_render_endpoint_id
+                    ):
+                        reason = "default_output_changed"
+                if reason is not None:
+                    self._recover_loopback(reason)
+
+            mic_stream = self._mic_stream
+            mic_reason: str | None = None
+            if mic_stream is None:
+                mic_reason = "mic_stream_missing"
+            elif not getattr(mic_stream, "active", True):
+                mic_reason = "mic_stream_inactive"
+            elif (
+                self._mic_callbacks_seen > 0
+                and (time.monotonic() - self._last_mic_callback_at > self._mic_stall_timeout_sec)
+            ):
+                mic_reason = "mic_callback_stalled"
+            if mic_reason is not None:
+                self._recover_mic(mic_reason)
+
+    def _recover_loopback(self, reason: str) -> None:
+        logger.warning("WASAPI loopback recovery triggered (%s); reconnecting...", reason)
+        flushed_tail: np.ndarray | None = None
+        with self._lock:
+            if not self._recording or self._watchdog_stop.is_set() or self._audio_mode != "dual":
+                return
+            self._close_loopback_locked()
+            self._system_level = 0.0
+            self._last_sys_preview_at = 0.0
+            if self._sys_segmenter is not None:
+                if self._sys_segmenter.in_speech:
+                    tail, _dur = self._sys_segmenter.finish()
+                    if tail.size > 0:
+                        flushed_tail = tail
+                self._sys_segmenter = self._make_sys_segmenter(self._pause_ms)
+            try:
+                self._start_loopback_locked(self._requested_loopback_index)
+            except Exception as exc:
+                self._close_loopback_locked()
+                logger.warning("WASAPI loopback reconnect failed (will retry): %s", exc)
+        if flushed_tail is not None:
+            self._emit_segment("system", flushed_tail)
+
+    def _recover_mic(self, reason: str) -> None:
+        logger.warning("Microphone stream recovery triggered (%s); reconnecting...", reason)
+        with self._lock:
+            if not self._recording or self._watchdog_stop.is_set():
+                return
+            self._close_mic_locked()
+            try:
+                self._open_mic_locked(self._requested_mic_index)
+                logger.info("Microphone stream reconnected")
+            except Exception as exc:
+                self._close_mic_locked()
+                logger.warning("Microphone stream reconnect failed (will retry): %s", exc)
 
     def _emit_segment(self, channel: AudioChannel, seg: np.ndarray) -> None:
         if seg.size == 0:
@@ -349,69 +633,101 @@ class MeetingAudioRecorder:
         except Exception:
             pass
 
+    def _log_callback_error(self, label: str, exc: Exception) -> None:
+        now = time.monotonic()
+        if now - self._last_cb_error_log_at >= 5.0:
+            self._last_cb_error_log_at = now
+            logger.warning("%s callback error: %s", label, exc)
+
     def _on_mic_audio(self, indata: np.ndarray, frames: int, time_info, status) -> None:  # noqa: ANN001
         if not self._recording:
             return
-        mono = np.ascontiguousarray(indata[:, 0], dtype=np.float32)
-        if mono.size == 0:
-            return
-        rms = math.sqrt(float(np.dot(mono, mono)) / float(mono.size))
-        self._mic_level = min(1.0, rms * 10.0)
+        try:
+            now = time.monotonic()
+            self._last_mic_callback_at = now
+            self._mic_callbacks_seen += 1
 
-        with self._tap_lock:
-            if self._tap_active:
-                copy_block = mono.copy()
-                self._tap_chunks.append(copy_block)
-                tap_cb = self._tap_callback
-            else:
-                copy_block = None
-                tap_cb = None
+            mono = np.ascontiguousarray(indata[:, 0], dtype=np.float32)
+            if mono.size == 0:
+                return
+            rms = math.sqrt(float(np.dot(mono, mono)) / float(mono.size))
+            self._mic_level = min(1.0, rms * 10.0)
 
-        if tap_cb is not None and copy_block is not None:
-            try:
-                tap_cb(copy_block)
-            except Exception:
-                pass
+            with self._tap_lock:
+                tap_active = self._tap_active
+                reset_mic = self._tap_reset_mic_segmenter
+                if reset_mic:
+                    self._tap_reset_mic_segmenter = False
+                in_cooldown = (not tap_active) and (now < self._tap_cooldown_until)
+                if tap_active:
+                    copy_block = mono.copy()
+                    self._tap_chunks.append(copy_block)
+                    tap_cb = self._tap_callback
+                else:
+                    copy_block = None
+                    tap_cb = None
 
-        seg_engine = self._mic_segmenter
-        if seg_engine is not None:
-            event = seg_engine.process_block(mono)
-            if event.segment is not None:
+            if reset_mic:
                 self._last_mic_preview_at = 0.0
-                self._emit_segment("mic", event.segment)
-            else:
-                self._maybe_emit_preview("mic", seg_engine)
+                if self._mic_segmenter is not None:
+                    self._mic_segmenter.reset_buffer()
+
+            if tap_active:
+                if tap_cb is not None and copy_block is not None:
+                    try:
+                        tap_cb(copy_block)
+                    except Exception:
+                        pass
+                return
+
+            if in_cooldown:
+                return
+
+            seg_engine = self._mic_segmenter
+            if seg_engine is not None:
+                event = seg_engine.process_block(mono)
+                if event.segment is not None:
+                    self._last_mic_preview_at = 0.0
+                    self._emit_segment("mic", event.segment)
+                else:
+                    self._maybe_emit_preview("mic", seg_engine)
+        except Exception as exc:
+            self._log_callback_error("Microphone", exc)
 
     def _on_loopback_audio(self, in_data: bytes, frame_count: int, time_info, status):  # noqa: ANN001
         import pyaudiowpatch as pyaudio
 
         if not self._recording:
             return (None, pyaudio.paComplete)
+        self._last_loopback_callback_at = time.monotonic()
         if not in_data:
             return (None, pyaudio.paContinue)
 
-        raw = np.frombuffer(in_data, dtype=np.float32)
-        mono_16k = resample_to_16k_mono(
-            raw,
-            src_rate=self._loopback_rate,
-            src_channels=self._loopback_channels,
-            target_rate=self.sample_rate,
-        )
-        if mono_16k.size > 0:
-            rms = math.sqrt(float(np.dot(mono_16k, mono_16k)) / float(mono_16k.size))
-            self._system_level = min(1.0, rms * 10.0)
-            seg_engine = self._sys_segmenter
-            if seg_engine is not None:
-                event = seg_engine.process_block(mono_16k)
-                if event.segment is not None:
-                    self._last_sys_preview_at = 0.0
-                    self._emit_segment("system", event.segment)
-                else:
-                    self._maybe_emit_preview("system", seg_engine)
+        try:
+            raw = np.frombuffer(in_data, dtype=np.float32)
+            mono_16k = resample_to_16k_mono(
+                raw,
+                src_rate=self._loopback_rate,
+                src_channels=self._loopback_channels,
+                target_rate=self.sample_rate,
+            )
+            if mono_16k.size > 0:
+                rms = math.sqrt(float(np.dot(mono_16k, mono_16k)) / float(mono_16k.size))
+                self._system_level = min(1.0, rms * 10.0)
+                seg_engine = self._sys_segmenter
+                if seg_engine is not None:
+                    event = seg_engine.process_block(mono_16k)
+                    if event.segment is not None:
+                        self._last_sys_preview_at = 0.0
+                        self._emit_segment("system", event.segment)
+                    else:
+                        self._maybe_emit_preview("system", seg_engine)
+        except Exception as exc:
+            self._log_callback_error("Loopback", exc)
 
         return (None, pyaudio.paContinue)
 
-    def _cleanup_streams_locked(self) -> None:
+    def _close_mic_locked(self) -> None:
         if self._mic_stream is not None:
             try:
                 self._mic_stream.stop()
@@ -423,6 +739,7 @@ class MeetingAudioRecorder:
                 pass
             self._mic_stream = None
 
+    def _close_loopback_locked(self) -> None:
         if self._loopback_stream is not None:
             try:
                 self._loopback_stream.stop_stream()
@@ -441,17 +758,35 @@ class MeetingAudioRecorder:
                 pass
             self._pa = None
 
+    def _cleanup_streams_locked(self) -> None:
+        self._close_mic_locked()
+        self._close_loopback_locked()
+
     def stop(self) -> None:
         """Stop capturing and flush any trailing speech segments."""
+        self._watchdog_stop.set()
         with self._lock:
+            wd = self._watchdog_thread
+            self._watchdog_thread = None
             if not self._recording:
-                return
-            self._recording = False
-            self._cleanup_streams_locked()
-            mic_seg = self._mic_segmenter
-            sys_seg = self._sys_segmenter
-            self._mic_segmenter = None
-            self._sys_segmenter = None
+                mic_seg = None
+                sys_seg = None
+            else:
+                self._recording = False
+                self._cleanup_streams_locked()
+                mic_seg = self._mic_segmenter
+                sys_seg = self._sys_segmenter
+                self._mic_segmenter = None
+                self._sys_segmenter = None
+
+        with self._tap_lock:
+            self._tap_active = False
+            self._tap_callback = None
+            self._tap_cooldown_until = 0.0
+            self._tap_reset_mic_segmenter = False
+
+        if wd is not None and wd.is_alive():
+            wd.join(timeout=2.0)
 
         if mic_seg is not None:
             tail, _dur = mic_seg.finish()

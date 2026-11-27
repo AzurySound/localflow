@@ -533,6 +533,11 @@ class MeetingStorage:
                             """,
                             (meeting_id, key, name, idx),
                         )
+                    elif name.strip():
+                        conn.execute(
+                            "UPDATE meeting_speakers SET display_name = ? WHERE id = ?",
+                            (name.strip(), int(existing["id"])),
+                        )
             self._sync_fts(conn, meeting_id)
             conn.commit()
 

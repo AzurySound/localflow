@@ -196,6 +196,39 @@ class TestSpeechSegmenter(unittest.TestCase):
         self.assertEqual(tail2.size, 0)
         self.assertEqual(dur1, dur2)
 
+    def test_max_segment_sec_splits_continuous_speech(self) -> None:
+        seg = SpeechSegmenter(sample_rate=SAMPLE_RATE, pause_ms=400, max_segment_sec=2.0)
+        stream = _tone(6000, rms=0.02)
+        events = _feed_blocks(seg, stream)
+        emitted = [ev.segment for ev in events if ev.segment is not None]
+        self.assertGreaterEqual(len(emitted), 2)
+        tail, duration = seg.finish()
+        stitched = np.concatenate([*emitted, tail])
+        self.assertTrue(np.array_equal(stitched, stream))
+        self.assertAlmostEqual(duration, 6.0, places=5)
+
+    def test_max_idle_preroll_bounds_buffered_silence_without_clipping_speech(self) -> None:
+        seg = SpeechSegmenter(sample_rate=SAMPLE_RATE, pause_ms=400, max_idle_preroll_ms=400)
+        stream = np.concatenate([
+            _tone(5000, rms=0.001),
+            _tone(512, rms=0.02),
+            _tone(448, rms=0.001),
+        ])
+        events = _feed_blocks(seg, stream)
+        emitted = [ev.segment for ev in events if ev.segment is not None]
+        self.assertEqual(len(emitted), 1)
+        self.assertLessEqual(emitted[0].size, int(SAMPLE_RATE * 1.3))
+        self.assertGreaterEqual(float(np.max(np.abs(emitted[0]))), 0.015)
+
+    def test_reset_buffer_discards_active_speech(self) -> None:
+        seg = SpeechSegmenter(sample_rate=SAMPLE_RATE, pause_ms=400)
+        _feed_blocks(seg, _tone(512, rms=0.02))
+        self.assertTrue(seg.in_speech)
+        seg.reset_buffer()
+        self.assertFalse(seg.in_speech)
+        tail, _ = seg.finish()
+        self.assertEqual(tail.size, 0)
+
 
 class _FakeInputStream:
     def __init__(self, **kwargs) -> None:

@@ -121,3 +121,11 @@ def test_summarizer_language_lock_and_too_short_guard(tmp_path: Path) -> None:
     )
     assert parsed.action_items == [("Проверить логи", "Вы")]
 
+    # Summary markdown formatter guarantees a blank line between opening paragraph and heading
+    formatted = MeetingSummarizer._parse_summary_output(
+        "TITLE: Итоги\nSUMMARY: Короткое введение.\n### Ключевые моменты\n- Деталь 1",
+        fallback_title="Итоги",
+    )
+    assert formatted.summary_md == "Короткое введение.\n\n### Ключевые моменты\n- Деталь 1"
+    assert MeetingSummarizer(llm).single_pass_char_limit <= 5000
+

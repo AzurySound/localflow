@@ -9,8 +9,8 @@ import re
 import threading
 from typing import Callable
 
-from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPainterPath, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -38,6 +38,7 @@ from localflow.i18n import DEFAULT_LANGUAGE, LanguageCode, normalize_language, t
 from localflow.llm.downloader import DownloadProgress, download_diarization_model
 from localflow.llm.model_catalog import find_diarization_model_path
 from localflow.notetaker.qa_engine import MeetingQAEngine, QAResult
+from localflow.notetaker.summarizer import format_summary_markdown
 from localflow.notetaker.storage import (
     MeetingActionItem,
     MeetingSpeaker,
@@ -248,10 +249,13 @@ class _SpeechBubble(QFrame):
             f"QFrame#WisprSpeechBubble {{ background-color: {bg}; border-radius: 12px; }}"
         )
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(13, 8, 13, 8)
+        lay.setContentsMargins(13, 9, 13, 10)
         lay.setSpacing(0)
 
         self._lbl = QLabel(text)
+        lbl_font = QFont(self._lbl.font())
+        lbl_font.setPixelSize(13)
+        self._lbl.setFont(lbl_font)
         self._lbl.setWordWrap(True)
         self._lbl.setMinimumWidth(0)
         self._lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -262,6 +266,33 @@ class _SpeechBubble(QFrame):
 
     def sync_max_width(self, max_width: int) -> None:
         self.setMaximumWidth(max(220, max_width))
+        self.updateGeometry()
+
+    def hasHeightForWidth(self) -> bool:  # type: ignore[override]
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # type: ignore[override]
+        m = self.layout().contentsMargins()
+        eff_w = min(max(120, width), self.maximumWidth())
+        inner_w = max(80, eff_w - m.left() - m.right())
+        fm = QFontMetrics(self._lbl.font())
+        fm_h = fm.boundingRect(
+            QRect(0, 0, inner_w, 10000),
+            Qt.TextFlag.TextWordWrap,
+            self._lbl.text(),
+        ).height()
+        lbl_h = self._lbl.heightForWidth(inner_w)
+        return max(lbl_h, fm_h) + m.top() + m.bottom()
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        m = self.layout().contentsMargins()
+        fm = QFontMetrics(self._lbl.font())
+        text_w = fm.horizontalAdvance(self._lbl.text())
+        w = min(self.maximumWidth(), max(100, text_w + m.left() + m.right() + 10))
+        return QSize(w, self.heightForWidth(w))
+
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        return self.sizeHint()
 
 
 class _ActionItemRow(QWidget):
@@ -391,11 +422,18 @@ class MeetingNoteWorkspace(QWidget):
         self._scroll_timer.setSingleShot(True)
         self._scroll_timer.setInterval(10)
         self._scroll_timer.timeout.connect(self._apply_scroll_to_bottom)
+        self._stick_to_bottom = True
+        self._programmatic_scroll = False
 
         self._copy_reset_timer = QTimer(self)
         self._copy_reset_timer.setSingleShot(True)
         self._copy_reset_timer.setInterval(1200)
         self._copy_reset_timer.timeout.connect(self._reset_copy_icon)
+
+        self._copy_summary_reset_timer = QTimer(self)
+        self._copy_summary_reset_timer.setSingleShot(True)
+        self._copy_summary_reset_timer.setInterval(1200)
+        self._copy_summary_reset_timer.timeout.connect(self._reset_copy_summary_icon)
 
         self._build_ui()
         self._connect_signals()
@@ -452,6 +490,7 @@ class MeetingNoteWorkspace(QWidget):
         self._privacy_lbl.setText(tr("notetaker.privacy_footer", self._lang))
         self._too_short_lbl.setText(tr("notetaker.summary.too_short", self._lang))
         self._force_sum_btn.setText(tr("notetaker.summary.force", self._lang))
+        self._copy_summary_btn.setText(tr("notetaker.btn.copy", self._lang))
         self._regen_btn.setText(tr("notetaker.btn.regenerate", self._lang))
         self._action_header.setText(tr("notetaker.action_items", self._lang))
         self._diar_label.setText(tr("notetaker.diar.banner", self._lang))
@@ -469,6 +508,7 @@ class MeetingNoteWorkspace(QWidget):
             self._rendered_live_meeting_id = None
             self._rendered_live_count = 0
             self._qa_card.setVisible(False)
+            self._stick_to_bottom = True
         self._current_meeting_id = meeting_id
         if select_tab is not None:
             self._set_active_tab(select_tab)
@@ -481,6 +521,7 @@ class MeetingNoteWorkspace(QWidget):
         if active:
             self._live_banner_dismissed = False
             self._too_short_meeting_id = None
+            self._stick_to_bottom = True
             self._interim_texts.clear()
             if meeting_id is not None and self._current_meeting_id != meeting_id:
                 self._current_meeting_id = meeting_id
@@ -746,23 +787,27 @@ class MeetingNoteWorkspace(QWidget):
         self._tr_body_lay = QVBoxLayout(self._tr_scroll_body)
         self._tr_body_lay.setContentsMargins(2, 2, 6, 8)
         self._tr_body_lay.setSpacing(6)
+        self._tr_body_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         self._committed_container = QWidget()
         self._committed_container.setStyleSheet("background: transparent;")
         self._committed_lay = QVBoxLayout(self._committed_container)
         self._committed_lay.setContentsMargins(0, 0, 0, 0)
         self._committed_lay.setSpacing(6)
+        self._committed_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         self._interim_container = QWidget()
         self._interim_container.setStyleSheet("background: transparent;")
         self._interim_lay = QVBoxLayout(self._interim_container)
         self._interim_lay.setContentsMargins(0, 4, 0, 0)
         self._interim_lay.setSpacing(6)
+        self._interim_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         self._tr_body_lay.addWidget(self._committed_container)
         self._tr_body_lay.addWidget(self._interim_container)
-        self._tr_body_lay.addStretch(1)
         self._tr_scroll.setWidget(self._tr_scroll_body)
+        self._tr_scroll.viewport().installEventFilter(self)
+        self._tr_scroll.verticalScrollBar().valueChanged.connect(self._on_transcript_scrolled)
         tr_lay.addWidget(self._tr_scroll, 1)
         self._tabs.addWidget(tr_page)
 
@@ -792,7 +837,13 @@ class MeetingNoteWorkspace(QWidget):
         sum_lay.addWidget(self._too_short_card)
 
         sum_hdr_row = QHBoxLayout()
+        sum_hdr_row.setSpacing(8)
         sum_hdr_row.addStretch(1)
+        self._copy_summary_btn = QPushButton("Copy")
+        self._copy_summary_btn.setObjectName("WisprPillBtn")
+        self._copy_summary_btn.setIconSize(QSize(13, 13))
+        self._copy_summary_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        sum_hdr_row.addWidget(self._copy_summary_btn)
         self._regen_btn = QPushButton("Summarize")
         self._regen_btn.setObjectName("WisprPillBtn")
         self._regen_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -802,7 +853,7 @@ class MeetingNoteWorkspace(QWidget):
         self._summary_view = QTextEdit()
         self._summary_view.setObjectName("WisprPlainEditor")
         self._summary_view.setReadOnly(True)
-        sum_lay.addWidget(self._summary_view, 3)
+        sum_lay.addWidget(self._summary_view, 1)
 
         self._action_header = QLabel("Action Items")
         self._action_header.setObjectName("SectionHeader")
@@ -818,9 +869,10 @@ class MeetingNoteWorkspace(QWidget):
         self._action_lay = QVBoxLayout(self._action_container)
         self._action_lay.setContentsMargins(0, 2, 0, 2)
         self._action_lay.setSpacing(4)
-        self._action_lay.addStretch(1)
+        self._action_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._action_scroll.setWidget(self._action_container)
-        sum_lay.addWidget(self._action_scroll, 2)
+        self._action_scroll.setFixedHeight(28)
+        sum_lay.addWidget(self._action_scroll, 0)
         self._tabs.addWidget(sum_page)
 
         root.addWidget(self._tabs, 1)
@@ -907,6 +959,7 @@ class MeetingNoteWorkspace(QWidget):
         self._tr_copy_btn.clicked.connect(self._on_copy_transcript_clicked)
         self._live_banner_close.clicked.connect(self._dismiss_live_banner)
 
+        self._copy_summary_btn.clicked.connect(self._on_copy_summary_clicked)
         self._regen_btn.clicked.connect(self._on_regen_clicked)
         self._force_sum_btn.clicked.connect(self._on_force_summarize_clicked)
         self._dock_state_btn.clicked.connect(self._on_dock_state_clicked)
@@ -1069,12 +1122,17 @@ class MeetingNoteWorkspace(QWidget):
         self._tr_search_btn.setIcon(render_icon("search", muted, 14))
         self._tr_speakers_btn.setIcon(render_icon("speakers", muted, 14))
         self._tr_copy_btn.setIcon(render_icon("copy", muted, 14))
+        self._copy_summary_btn.setIcon(render_icon("copy", t["text_secondary"], 13))
         self._live_banner_close.setIcon(render_icon("close", muted, 11))
         self._update_dock_controls()
 
     def _reset_copy_icon(self) -> None:
         t = get_theme_tokens(self._theme)
         self._tr_copy_btn.setIcon(render_icon("copy", t["text_muted"], 14))
+
+    def _reset_copy_summary_icon(self) -> None:
+        t = get_theme_tokens(self._theme)
+        self._copy_summary_btn.setIcon(render_icon("copy", t["text_secondary"], 13))
 
     def _set_active_tab(self, idx: int) -> None:
         self._active_tab_idx = idx
@@ -1145,6 +1203,7 @@ class MeetingNoteWorkspace(QWidget):
 
         self._title_edit.setEnabled(has_meeting)
         self._thoughts_edit.setEnabled(has_meeting)
+        self._copy_summary_btn.setEnabled(has_meeting and meeting is not None and bool(meeting.summary_md.strip()))
         self._regen_btn.setEnabled(has_meeting and not self._is_recording and self._summarizing_meeting_id != mid)
         self._live_wave.set_active(is_rec_this)
         self._update_dock_controls()
@@ -1188,7 +1247,7 @@ class MeetingNoteWorkspace(QWidget):
             self._too_short_card.setVisible(show_too_short)
             self._summary_view.setVisible(not show_too_short)
             if meeting.summary_md.strip():
-                self._summary_view.setMarkdown(meeting.summary_md)
+                self._set_summary_markdown(meeting.summary_md)
             else:
                 self._summary_view.setPlainText("" if (show_too_short or is_sum_active) else tr("notetaker.no_summary", self._lang))
         finally:
@@ -1235,7 +1294,12 @@ class MeetingNoteWorkspace(QWidget):
             more_btn.clicked.connect(self._on_speakers_menu_clicked)
             self._speakers_lay.insertWidget(self._speakers_lay.count() - 1, more_btn)
 
-    def _on_speaker_chip_clicked(self, speaker: MeetingSpeaker) -> None:
+    def _on_speaker_chip_clicked(
+        self,
+        speaker: MeetingSpeaker,
+        *,
+        global_pos: QPoint | None = None,
+    ) -> None:
         if self._current_meeting_id is None:
             return
         menu = QMenu(self)
@@ -1252,7 +1316,7 @@ class MeetingNoteWorkspace(QWidget):
             merge_actions[act] = other
         merge_menu.setEnabled(bool(others))
 
-        chosen = menu.exec(self.cursor().pos())
+        chosen = menu.exec(global_pos if global_pos is not None else self.cursor().pos())
         if chosen is None:
             return
         if chosen == rename_act:
@@ -1265,16 +1329,45 @@ class MeetingNoteWorkspace(QWidget):
             ok = dlg.exec() == int(QInputDialog.DialogCode.Accepted)
             new_name = dlg.textValue()
             if ok and new_name.strip():
-                self._storage.rename_speaker(self._current_meeting_id, speaker.speaker_key, new_name.strip())
-                self._render_speakers_bar()
-                self._render_transcript(force_rebuild=True)
-                self.meeting_updated.emit(self._current_meeting_id)
+                self._apply_speaker_change(
+                    lambda mid: self._storage.rename_speaker(mid, speaker.speaker_key, new_name.strip())
+                )
         elif chosen in merge_actions:
             target = merge_actions[chosen]
-            self._storage.merge_speakers(self._current_meeting_id, speaker.speaker_key, target.speaker_key)
-            self._render_speakers_bar()
-            self._render_transcript(force_rebuild=True)
-            self.meeting_updated.emit(self._current_meeting_id)
+            self._apply_speaker_change(
+                lambda mid: self._storage.merge_speakers(mid, speaker.speaker_key, target.speaker_key)
+            )
+
+    def _apply_speaker_change(self, mutator: Callable[[int], None]) -> None:
+        mid = self._current_meeting_id
+        if mid is None:
+            return
+        sb = self._tr_scroll.verticalScrollBar()
+        saved_val = sb.value()
+        was_stick = self._stick_to_bottom
+        mutator(mid)
+        self._render_speakers_bar()
+        self._render_transcript(force_rebuild=True)
+        if not was_stick:
+            QTimer.singleShot(0, lambda v=saved_val: self._restore_transcript_scroll(v))
+        self.meeting_updated.emit(mid)
+
+    def _restore_transcript_scroll(self, val: int) -> None:
+        sb = self._tr_scroll.verticalScrollBar()
+        self._programmatic_scroll = True
+        try:
+            sb.setValue(min(val, sb.maximum()))
+        finally:
+            self._programmatic_scroll = False
+
+    def _on_transcript_speaker_context_menu(self, speaker_key: str, global_pos: QPoint) -> None:
+        if self._current_meeting_id is None:
+            return
+        speakers = {s.speaker_key: s for s in self._storage.get_speakers(self._current_meeting_id)}
+        spk = speakers.get(speaker_key)
+        if spk is None:
+            return
+        self._on_speaker_chip_clicked(spk, global_pos=global_pos)
 
     def _on_speakers_menu_clicked(self) -> None:
         if self._current_meeting_id is None:
@@ -1289,22 +1382,41 @@ class MeetingNoteWorkspace(QWidget):
         if chosen in actions:
             self._on_speaker_chip_clicked(actions[chosen])
 
+    def _set_summary_markdown(self, md: str) -> None:
+        normalized = format_summary_markdown(md)
+        self._summary_view.setMarkdown(normalized)
+        doc = self._summary_view.document()
+        block = doc.firstBlock()
+        while block.isValid():
+            fmt = block.blockFormat()
+            if fmt.headingLevel() > 0 and block.blockNumber() > 0:
+                cursor = QTextCursor(block)
+                new_fmt = block.blockFormat()
+                new_fmt.setTopMargin(16.0)
+                new_fmt.setBottomMargin(6.0)
+                cursor.setBlockFormat(new_fmt)
+            block = block.next()
+
     def _clear_action_items(self) -> None:
-        while self._action_lay.count() > 1:
+        while self._action_lay.count() > 0:
             item = self._action_lay.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
 
     def _render_action_items(self) -> None:
         self._clear_action_items()
         if self._current_meeting_id is None:
+            self._update_action_scroll_height()
             return
         items: list[MeetingActionItem] = self._storage.get_action_items(self._current_meeting_id)
         if not items:
             empty = QLabel(tr("notetaker.no_action_items", self._lang))
             empty.setObjectName("FieldHint")
-            self._action_lay.insertWidget(0, empty)
+            self._action_lay.addWidget(empty)
+            self._update_action_scroll_height()
             return
         for item in items:
             label = f"{item.text} ({item.owner})" if item.owner else item.text
@@ -1317,7 +1429,30 @@ class MeetingNoteWorkspace(QWidget):
             row.toggled.connect(
                 lambda checked, item_id=item.id: self._on_action_toggled(item_id, checked)
             )
-            self._action_lay.insertWidget(self._action_lay.count() - 1, row)
+            self._action_lay.addWidget(row)
+        self._update_action_scroll_height()
+
+    def _update_action_scroll_height(self) -> None:
+        rows = self._action_container.findChildren(_ActionItemRow)
+        if not rows:
+            self._action_scroll.setFixedHeight(28)
+            return
+        vp_w = self._action_scroll.viewport().width()
+        eff_w = vp_w if vp_w > 120 else max(300, self.width() - 40)
+        lbl_w = max(180, eff_w - 36)
+        total_h = 4
+        for row in rows:
+            lbl = row._lbl
+            fm = QFontMetrics(lbl.font())
+            text_h = fm.boundingRect(
+                QRect(0, 0, lbl_w, 10000),
+                Qt.TextFlag.TextWordWrap,
+                lbl.text(),
+            ).height()
+            row_h = max(26, max(text_h, lbl.heightForWidth(lbl_w)) + 6)
+            total_h += row_h + 4
+        max_cap = max(110, int(max(420, self.height()) * 0.34))
+        self._action_scroll.setFixedHeight(max(36, min(total_h, max_cap)))
 
     def _on_action_toggled(self, item_id: int, checked: bool) -> None:
         self._storage.set_action_item_done(item_id, checked)
@@ -1330,6 +1465,8 @@ class MeetingNoteWorkspace(QWidget):
             item = lay.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
             elif item.layout() is not None:
                 MeetingNoteWorkspace._clear_layout(item.layout())  # type: ignore[arg-type]
@@ -1405,13 +1542,58 @@ class MeetingNoteWorkspace(QWidget):
             return max(220, vp_w - 32)
         return 390
 
-    def resizeEvent(self, event) -> None:  # type: ignore[override]
-        super().resizeEvent(event)
+    def _sync_bubble_widths(self) -> None:
         max_w = self._bubble_max_width()
         for b in self._committed_container.findChildren(_SpeechBubble):
             b.sync_max_width(max_w)
         for b in self._interim_container.findChildren(_SpeechBubble):
             b.sync_max_width(max_w)
+        self._tr_scroll_body.updateGeometry()
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        if watched is self._tr_scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._sync_bubble_widths()
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._sync_bubble_widths()
+        self._update_action_scroll_height()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._update_action_scroll_height()
+
+    def _make_speaker_header_label(
+        self,
+        speaker_key: str,
+        display_name: str,
+        color: str,
+        *,
+        timestamp_text: str = "",
+        margin_top: int = 6,
+    ) -> QLabel:
+        if timestamp_text:
+            ts_color = "#9ca3af" if self._theme == "light" else "#6e6e78"
+            hdr = QLabel(
+                f"<b style='color:{color};'>{html.escape(display_name)}</b> "
+                f"<span style='color:{ts_color};font-size:11px;margin-left:6px;'>{timestamp_text}</span>"
+            )
+            hdr.setTextFormat(Qt.TextFormat.RichText)
+            hdr.setStyleSheet("QLabel { font-size: 13px; margin-top: 10px; margin-bottom: 2px; }")
+        else:
+            hdr = QLabel(display_name)
+            hdr.setStyleSheet(
+                f"QLabel {{ color: {color}; font-size: 13px; font-weight: 600; margin-top: {margin_top}px; }}"
+            )
+        hdr.setProperty("speaker_key", speaker_key)
+        hdr.setCursor(Qt.CursorShape.PointingHandCursor)
+        hdr.setToolTip(tr("notetaker.speaker.rename", self._lang))
+        hdr.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        hdr.customContextMenuRequested.connect(
+            lambda pos, sk=speaker_key, w=hdr: self._on_transcript_speaker_context_menu(sk, w.mapToGlobal(pos))
+        )
+        return hdr
 
     def _append_live_utterance_widget(
         self,
@@ -1425,10 +1607,7 @@ class MeetingNoteWorkspace(QWidget):
         color = colors[(spk.color_idx if spk is not None else 1) % len(colors)]
 
         if utt.speaker_key != self._last_live_speaker_key:
-            hdr = QLabel(html.escape(spk_name))
-            hdr.setStyleSheet(
-                f"QLabel {{ color: {color}; font-size: 13px; font-weight: 600; margin-top: 6px; }}"
-            )
+            hdr = self._make_speaker_header_label(utt.speaker_key, spk_name, color, margin_top=6)
             self._committed_lay.addWidget(hdr)
             self._last_live_speaker_key = utt.speaker_key
 
@@ -1454,8 +1633,7 @@ class MeetingNoteWorkspace(QWidget):
             is_self = (spk.is_self if spk is not None else spk_key == "you")
             if spk_key != self._last_live_speaker_key:
                 color = colors[(spk.color_idx if spk is not None else 1) % len(colors)]
-                hdr = QLabel(html.escape(spk_name))
-                hdr.setStyleSheet(f"QLabel {{ color: {color}; font-size: 13px; font-weight: 600; }}")
+                hdr = self._make_speaker_header_label(spk_key, spk_name, color, margin_top=0)
                 self._interim_lay.addWidget(hdr)
             bubble = _SpeechBubble(
                 text,
@@ -1481,7 +1659,6 @@ class MeetingNoteWorkspace(QWidget):
             return
 
         colors = _SPEAKER_COLORS_LIGHT if self._theme == "light" else _SPEAKER_COLORS_DARK
-        ts_color = "#9ca3af" if self._theme == "light" else "#6e6e78"
         body_color = "#1f2937" if self._theme == "light" else "#e4e4e7"
 
         prev_spk: str | None = None
@@ -1491,12 +1668,9 @@ class MeetingNoteWorkspace(QWidget):
             color = colors[(spk.color_idx if spk is not None else 1) % len(colors)]
             if u.speaker_key != prev_spk:
                 ts = format_timestamp(u.start_sec)
-                hdr = QLabel(
-                    f"<b style='color:{color};'>{html.escape(spk_name)}</b> "
-                    f"<span style='color:{ts_color};font-size:11px;margin-left:6px;'>{ts}</span>"
+                hdr = self._make_speaker_header_label(
+                    u.speaker_key, spk_name, color, timestamp_text=ts
                 )
-                hdr.setTextFormat(Qt.TextFormat.RichText)
-                hdr.setStyleSheet("QLabel { font-size: 13px; margin-top: 10px; margin-bottom: 2px; }")
                 self._committed_lay.addWidget(hdr)
                 prev_spk = u.speaker_key
 
@@ -1514,12 +1688,27 @@ class MeetingNoteWorkspace(QWidget):
             p.setStyleSheet(f"QLabel {{ color: {body_color}; font-size: 13.5px; line-height: 1.45; margin-bottom: 4px; }}")
             self._committed_lay.addWidget(p)
 
-    def _scroll_transcript_to_bottom(self) -> None:
-        self._scroll_timer.start()
+    def _on_transcript_scrolled(self, value: int) -> None:
+        if self._programmatic_scroll:
+            return
+        sb = self._tr_scroll.verticalScrollBar()
+        self._stick_to_bottom = (sb.maximum() - value) <= 80
+
+    def _scroll_transcript_to_bottom(self, *, force: bool = False) -> None:
+        if force:
+            self._stick_to_bottom = True
+        if self._stick_to_bottom:
+            self._scroll_timer.start()
 
     def _apply_scroll_to_bottom(self) -> None:
+        if not self._stick_to_bottom:
+            return
         sb = self._tr_scroll.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        self._programmatic_scroll = True
+        try:
+            sb.setValue(sb.maximum())
+        finally:
+            self._programmatic_scroll = False
 
     # ---- Slots & Background Actions ----
 
@@ -1589,6 +1778,21 @@ class MeetingNoteWorkspace(QWidget):
             self._tr_copy_btn.setIcon(render_icon("check", t["accent"], 14))
             self._copy_reset_timer.start()
 
+    def _on_copy_summary_clicked(self) -> None:
+        if self._current_meeting_id is None:
+            return
+        meeting = self._storage.get_meeting(self._current_meeting_id)
+        if meeting is None or not meeting.summary_md.strip():
+            return
+        formatted_md = format_summary_markdown(meeting.summary_md)
+        mime = QMimeData()
+        mime.setText(formatted_md)
+        mime.setHtml(self._summary_view.toHtml())
+        QApplication.clipboard().setMimeData(mime)
+        t = get_theme_tokens(self._theme)
+        self._copy_summary_btn.setIcon(render_icon("check", t["accent"], 13))
+        self._copy_summary_reset_timer.start()
+
     def _on_regen_clicked(self) -> None:
         if self._current_meeting_id is None:
             return
@@ -1618,15 +1822,25 @@ class MeetingNoteWorkspace(QWidget):
         self._qa_scope_btn.setText(tr(key, self._lang))
 
     def _on_what_missed_clicked(self) -> None:
-        self._ask_question_text(tr("notetaker.qa.what_missed_prompt", self._lang), force_current=True)
+        self._ask_question_text(
+            tr("notetaker.qa.what_missed_prompt", self._lang),
+            force_current=True,
+            plain_bullets=True,
+        )
 
     def _on_ask_ai_submit(self) -> None:
         q = self._qa_input.text().strip()
         if not q:
             return
-        self._ask_question_text(q, force_current=False)
+        self._ask_question_text(q, force_current=False, plain_bullets=False)
 
-    def _ask_question_text(self, question: str, *, force_current: bool) -> None:
+    def _ask_question_text(
+        self,
+        question: str,
+        *,
+        force_current: bool,
+        plain_bullets: bool = False,
+    ) -> None:
         llm = self._llm_factory() if self._llm_factory is not None else None
         if llm is None:
             self._qa_card.setVisible(True)
@@ -1641,11 +1855,17 @@ class MeetingNoteWorkspace(QWidget):
         self._qa_input.setEnabled(False)
         self._qa_missed_btn.setEnabled(False)
         lang_code = self._lang
+        self._qa_plain_mode = plain_bullets
 
         def _worker() -> None:
             try:
                 engine = MeetingQAEngine(self._storage, llm)  # type: ignore[arg-type]
-                res = engine.answer_question(question, meeting_id=target_mid, lang=lang_code)
+                res = engine.answer_question(
+                    question,
+                    meeting_id=target_mid,
+                    lang=lang_code,
+                    plain_bullets=plain_bullets,
+                )
                 self._qa_done_signal.emit(res, "")
             except Exception as exc:
                 self._qa_done_signal.emit(None, str(exc))
@@ -1659,10 +1879,11 @@ class MeetingNoteWorkspace(QWidget):
             self._qa_answer.setPlainText(err)
             return
         if isinstance(result, QAResult):
-            cites = ", ".join(f"[{c.title} · {c.date_label}]" for c in result.citations)
             text = result.answer
-            if cites:
-                text += f"\n\nSources: {cites}"
+            if not getattr(self, "_qa_plain_mode", False):
+                cites = ", ".join(f"[{c.title} · {c.date_label}]" for c in result.citations)
+                if cites:
+                    text += f"\n\nSources: {cites}"
             self._qa_answer.setPlainText(text)
             self._qa_input.clear()
 

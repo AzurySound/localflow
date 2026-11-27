@@ -49,6 +49,8 @@ class SpeechSegmenter:
         min_segment_speech_ms: int = 250,
         edge_pad_ms: int = 150,
         silence_auto_stop_sec: float | None = None,
+        max_segment_sec: float | None = None,
+        max_idle_preroll_ms: int | None = None,
     ) -> None:
         if sample_rate <= 0:
             raise ValueError("sample_rate must be > 0")
@@ -64,6 +66,16 @@ class SpeechSegmenter:
         self._silence_auto_stop_samples = (
             max(1, int(round(sample_rate * silence_auto_stop_sec)))
             if silence_auto_stop_sec is not None and silence_auto_stop_sec > 0
+            else None
+        )
+        self._max_segment_samples = (
+            max(1, int(round(sample_rate * max_segment_sec)))
+            if max_segment_sec is not None and max_segment_sec > 0
+            else None
+        )
+        self._max_idle_preroll_samples = (
+            max(0, int(round(sample_rate * max_idle_preroll_ms / 1000.0)))
+            if max_idle_preroll_ms is not None and max_idle_preroll_ms >= 0
             else None
         )
 
@@ -114,6 +126,16 @@ class SpeechSegmenter:
         if len(arr) > max_samples:
             arr = arr[-max_samples:]
         return arr.copy()
+
+    def reset_buffer(self) -> None:
+        """Discard any uncommitted audio and reset active speech state without losing sample clock."""
+        self._chunks.clear()
+        self._committed_sample = self._total_samples
+        self._in_speech = False
+        self._onset_speech_samples = 0
+        self._segment_speech_samples = 0
+        self._pause_silence_samples = 0
+        self._last_speech_end_sample = None
 
     def _pop_samples_until(self, target_sample: int) -> np.ndarray:
         need = target_sample - self._committed_sample
@@ -168,12 +190,26 @@ class SpeechSegmenter:
                 self._onset_speech_samples = 0
                 if self._has_heard_speech:
                     self._session_trailing_silence_samples += n
+                if self._max_idle_preroll_samples is not None and self._segment_speech_samples == 0:
+                    excess = (self._total_samples - self._committed_sample) - self._max_idle_preroll_samples
+                    if excess > 0:
+                        self._pop_samples_until(self._committed_sample + excess)
         else:
             if rms >= self.silence_rms_threshold:
                 self._segment_speech_samples += n
                 self._last_speech_end_sample = self._total_samples
                 self._pause_silence_samples = 0
                 self._session_trailing_silence_samples = 0
+                if (
+                    self._max_segment_samples is not None
+                    and self._segment_speech_samples >= self._max_segment_samples
+                ):
+                    segment = self._pop_samples_until(self._total_samples)
+                    self._in_speech = False
+                    self._onset_speech_samples = 0
+                    self._segment_speech_samples = 0
+                    self._pause_silence_samples = 0
+                    self._last_speech_end_sample = None
             else:
                 self._pause_silence_samples += n
                 self._session_trailing_silence_samples += n

@@ -146,12 +146,26 @@ class OnnxSpeakerEmbedder:
             return False
 
     def embed(self, audio: np.ndarray, *, sample_rate: int = 16000) -> np.ndarray | None:
-        """Compute L2-normalized speaker embedding for audio >= 0.6 s."""
-        if audio.size < int(sample_rate * 0.6):
+        """Compute L2-normalized speaker embedding for audio >= 0.6 s after stripping silence."""
+        wav = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if wav.size < int(sample_rate * 0.6):
             return None
         if not self._ensure_loaded():
             return None
-        fbank = compute_kaldi_fbank(audio, sample_rate=sample_rate)
+        frame_len = max(160, int(sample_rate * 0.02))
+        n_frames = wav.size // frame_len
+        if n_frames > 0:
+            framed = wav[: n_frames * frame_len].reshape(n_frames, frame_len)
+            rms = np.sqrt(np.mean(framed * framed, axis=1))
+            peak_rms = float(np.max(rms)) if rms.size else 0.0
+            if peak_rms > 0.0:
+                thresh = max(0.005, 0.12 * peak_rms)
+                voiced = framed[rms >= thresh].reshape(-1)
+                if voiced.size >= int(sample_rate * 0.5):
+                    wav = voiced
+                elif voiced.size < int(sample_rate * 0.3):
+                    return None
+        fbank = compute_kaldi_fbank(wav, sample_rate=sample_rate)
         if fbank.shape[0] < 35:
             return None
         inp = fbank[None, :, :].astype(np.float32, copy=False)
@@ -177,8 +191,8 @@ class OnlineSpeakerTracker:
     def __init__(
         self,
         *,
-        similarity_threshold: float = 0.50,
-        max_speakers: int = 16,
+        similarity_threshold: float = 0.38,
+        max_speakers: int = 12,
         prefix: str = "spk_",
     ) -> None:
         self.similarity_threshold = similarity_threshold
@@ -215,7 +229,7 @@ class OnlineSpeakerTracker:
         )
         if should_reuse:
             cluster = self._clusters[best_idx]
-            if best_sim >= 0.42:
+            if best_sim >= 0.35:
                 n = cluster.count
                 updated = l2_normalize((cluster.centroid * float(n) + emb) / float(n + 1))
                 cluster.centroid = updated
@@ -230,39 +244,62 @@ class OnlineSpeakerTracker:
 def refine_speaker_clusters(
     items: list[tuple[int, np.ndarray]],
     *,
-    similarity_threshold: float = 0.52,
+    similarity_threshold: float = 0.42,
+    outlier_threshold: float = 0.25,
     prefix: str = "spk_",
 ) -> dict[int, str]:
-    """Post-call average-linkage agglomerative clustering to merge split speaker clusters."""
+    """Post-call centroid clustering to merge split speaker clusters and absorb single-turn outliers."""
     if not items:
         return {}
     if len(items) == 1:
         return {items[0][0]: f"{prefix}1"}
 
-    clusters: list[list[int]] = [[i] for i in range(len(items))]
     embs = [l2_normalize(vec) for _, vec in items]
+    clusters: list[list[int]] = [[i] for i in range(len(items))]
 
-    def _cluster_sim(c1: list[int], c2: list[int]) -> float:
-        total = 0.0
-        for i in c1:
-            for j in c2:
-                total += float(np.dot(embs[i], embs[j]))
-        return total / float(len(c1) * len(c2))
+    def _centroid(indices: list[int]) -> np.ndarray:
+        acc = np.sum([embs[i] for i in indices], axis=0)
+        return l2_normalize(acc)
+
+    centroids: list[np.ndarray] = [embs[i] for i in range(len(items))]
 
     while len(clusters) > 1:
-        best_pair: tuple[int, int] | None = None
-        best_sim = -1.0
-        for a in range(len(clusters)):
-            for b in range(a + 1, len(clusters)):
-                sim = _cluster_sim(clusters[a], clusters[b])
-                if sim > best_sim:
-                    best_sim = sim
-                    best_pair = (a, b)
-        if best_pair is None or best_sim < similarity_threshold:
+        centroid_mat = np.vstack(centroids)
+        sim_mat = centroid_mat @ centroid_mat.T
+        sim_mat[np.tril_indices(len(clusters))] = -2.0
+        flat = int(np.argmax(sim_mat))
+        a, b = divmod(flat, len(clusters))
+        best_sim = float(sim_mat[a, b])
+        if best_sim < similarity_threshold:
             break
-        a, b = best_pair
         clusters[a] = clusters[a] + clusters[b]
         clusters.pop(b)
+        centroids[a] = _centroid(clusters[a])
+        centroids.pop(b)
+
+    if len(clusters) > 1 and any(len(cl) >= 2 for cl in clusters):
+        merged = True
+        while merged and len(clusters) > 1:
+            merged = False
+            for i, cl in enumerate(clusters):
+                if len(cl) != 1:
+                    continue
+                best_target = -1
+                best_sim = -1.0
+                for j, other in enumerate(clusters):
+                    if j == i or len(other) < 2:
+                        continue
+                    sim = float(np.dot(centroids[i], centroids[j]))
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_target = j
+                if best_target >= 0 and best_sim >= outlier_threshold:
+                    clusters[best_target] = clusters[best_target] + cl
+                    centroids[best_target] = _centroid(clusters[best_target])
+                    clusters.pop(i)
+                    centroids.pop(i)
+                    merged = True
+                    break
 
     # Sort clusters by earliest utterance appearance so spk_1 speaks first
     clusters.sort(key=lambda cl: min(cl))

@@ -592,8 +592,8 @@ QListWidget#historyList::item {{
     background-color: {t["list_bg"]};
     border: 1px solid {t["list_border"]};
     border-radius: 9px;
-    padding: 10px 12px;
-    margin-bottom: 6px;
+    padding: 8px 10px;
+    margin: 0px 4px 4px 0px;
     color: {t["text"]};
 }}
 QListWidget#historyList::item:hover {{

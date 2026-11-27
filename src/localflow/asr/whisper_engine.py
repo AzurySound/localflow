@@ -112,6 +112,11 @@ class WhisperEngine:
         self._active_device = "unknown"
         self._active_compute_type = "unknown"
         self._last_error: str | None = None
+        self._last_detected_language: tuple[str, float] | None = None
+
+    @property
+    def last_detected_language(self) -> tuple[str, float] | None:
+        return self._last_detected_language
 
     @property
     def status(self) -> ASRStatus:
@@ -196,7 +201,13 @@ class WhisperEngine:
         with self._lock:
             self.initial_prompt = initial_prompt
 
-    def _run_model_transcribe(self, audio: np.ndarray, effective_prompt: str):
+    def _run_model_transcribe(
+        self,
+        audio: np.ndarray,
+        effective_prompt: str,
+        *,
+        language: str | None = None,
+    ):
         """Invoke faster-whisper with anti-hallucination decoding guards."""
         assert self._model is not None
         vad_params = {
@@ -207,6 +218,7 @@ class WhisperEngine:
         try:
             return self._model.transcribe(
                 audio,
+                language=language,
                 beam_size=self.beam_size,
                 vad_filter=True,
                 vad_parameters=vad_params,
@@ -220,12 +232,21 @@ class WhisperEngine:
         except TypeError:
             return self._model.transcribe(
                 audio,
+                language=language,
                 beam_size=self.beam_size,
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 350},
                 condition_on_previous_text=False,
                 initial_prompt=effective_prompt or None,
             )
+
+    def _record_detected_language(self, info) -> None:
+        lang = getattr(info, "language", None)
+        prob = getattr(info, "language_probability", None)
+        if isinstance(lang, str) and lang:
+            self._last_detected_language = (lang.lower(), float(prob or 0.0))
+        else:
+            self._last_detected_language = None
 
     @staticmethod
     def _filter_segment_text(seg) -> str:
@@ -239,7 +260,13 @@ class WhisperEngine:
             return ""
         return clean_whisper_hallucinations(raw_txt)
 
-    def transcribe(self, audio: np.ndarray, *, initial_prompt: str | None = None) -> str:
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        *,
+        initial_prompt: str | None = None,
+        language: str | None = None,
+    ) -> str:
         """Transcribe a 16 kHz mono float32 numpy array."""
         trimmed = trim_edge_silence(audio)
         if trimmed.size == 0:
@@ -249,7 +276,8 @@ class WhisperEngine:
             if self._model is None:
                 raise RuntimeError("ASR model is not loaded yet.")
             effective_prompt = self.initial_prompt if initial_prompt is None else initial_prompt
-            segments, _info = self._run_model_transcribe(trimmed, effective_prompt)
+            segments, info = self._run_model_transcribe(trimmed, effective_prompt, language=language)
+            self._record_detected_language(info)
             parts = [txt for seg in segments if (txt := self._filter_segment_text(seg))]
             return clean_whisper_hallucinations(" ".join(parts).strip())
 
@@ -259,6 +287,7 @@ class WhisperEngine:
         *,
         initial_prompt: str | None = None,
         sample_rate: int = 16000,
+        language: str | None = None,
     ) -> list[TranscriptSegment]:
         """Transcribe a 16 kHz mono float32 array and return timestamped segments."""
         if audio.size == 0:
@@ -279,7 +308,8 @@ class WhisperEngine:
             if self._model is None:
                 raise RuntimeError("ASR model is not loaded yet.")
             effective_prompt = self.initial_prompt if initial_prompt is None else initial_prompt
-            segments, _info = self._run_model_transcribe(trimmed, effective_prompt)
+            segments, info = self._run_model_transcribe(trimmed, effective_prompt, language=language)
+            self._record_detected_language(info)
             result: list[TranscriptSegment] = []
             for seg in segments:
                 txt = self._filter_segment_text(seg)

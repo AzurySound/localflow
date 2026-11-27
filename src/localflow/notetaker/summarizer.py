@@ -55,58 +55,78 @@ _ACTION_LINE_RE = re.compile(r"^\s*(?:[-*]|\d+[.)])\s*(?:\[[ xX]\]\s*)?(.+)$")
 _OWNER_TAIL_RE = re.compile(r"^(.*?)\s*(?:\(([^()]{1,40})\)|\[([^\[\]]{1,40})\])\s*$")
 
 
+def format_summary_markdown(text: str) -> str:
+    """Normalize summary markdown so headings have a blank separator line and no long dashes."""
+    cleaned = strip_long_dashes((text or "").strip())
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"\r\n?", "\n", cleaned)
+    cleaned = re.sub(r"(?im)^(?:SUMMARY|РЕЗЮМЕ)\s*:\s*", "", cleaned, count=1).strip()
+    cleaned = re.sub(r"([^\n])\n(#{1,6}\s+)", r"\1\n\n\2", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned
+
+
 def _build_summary_system_prompt(target_lang: str) -> str:
     if target_lang == "Russian":
         return (
-            "Ты — элитный AI-ассистент встреч в стиле Wispr Flow. Составь живое, конкретное и отлично "
-            "структурированное саммари.\n"
+            "Ты - элитный AI-ассистент встреч в стиле Wispr Flow. Составь точное, живое и структурированное саммари по ВСЕЙ беседе целиком.\n"
             "ЯЗЫК: пиши ВЕСЬ ответ (TITLE, SUMMARY и ACTION_ITEMS) строго на русском языке, "
-            "независимо от языка реплик в транскрипте (технические/IT-термины сохраняй как в оригинале).\n"
-            "СТИЛЬ И ТОЧНОСТЬ:\n"
-            "1. ЗАПРЕЩЕНЫ канцеляризмы и пассивные штампы («Обсуждались аспекты...», «Были подняты вопросы...», "
-            "«Обсуждено, что...», «Было отмечено...», «Определена договоренность...»). Пиши кратко, по делу, "
-            "активными глаголами.\n"
-            "2. СОХРАНЯЙ конкретику: все цифры, проценты, сроки, имена людей, названия систем/инструментов (Excel, ВОР, "
-            "векторная база, слепые тесты и т.д.).\n"
-            "3. Если в <my_thoughts> есть заметки пользователя — обязательно сделай на них акцент в саммари.\n"
-            "4. НИКОГДА не используй длинные тире (em-dash или en-dash); используй запятую, двоеточие или короткий дефис '-'.\n"
-            "СТРУКТУРА ОТВЕТА (соблюдай точные заголовки):\n"
-            "TITLE: <короткий точный заголовок 3-6 слов>\n"
+            "сохраняя имена участников, бренды и технические/IT-термины как в оригинале.\n"
+            "ГЛАВНЫЕ ПРИНЦИПЫ:\n"
+            "1. ЗАГОЛОВОК (TITLE): 3-7 слов по сути встречи. ЗАПРЕЩЕНО начинать TITLE со слова «Обсуждение».\n"
+            "2. ОХВАТ ВСЕХ ТЕМ: сначала выдели КАЖДУЮ значимую смысловую тему от начала до конца разговора. "
+            "Количество пунктов должно соответствовать объёму и числу тем (2-4 в короткой беседе, 5-9 в насыщенной встрече) - "
+            "НЕ ограничивайся 3-4 пунктами и НЕ сливай разные темы в одну общую строчку.\n"
+            "3. КОНКРЕТНЫЙ ИТОГ ПО КАЖДОЙ ТЕМЕ: каждый пункт называет тему и фиксирует реальный результат "
+            "(кто что решил, выиграли или проиграли, что сработало или нет, причины споров, точные цифры, время, компании, ключевые слова). "
+            "Игнорируй явные ослышки ASR и мусорные вставки.\n"
+            "4. СТИЛЬ: ЗАПРЕЩЕНЫ канцеляризмы и штампы («Обсуждались аспекты...», «Были подняты вопросы...», "
+            "«Было отмечено...», «Большая часть обсуждения была посвящена...»). Пиши кратко и активными глаголами.\n"
+            "5. Если в <my_thoughts> есть заметки пользователя - обязательно отрази их.\n"
+            "6. НИКОГДА не используй длинные тире (em-dash или en-dash); используй запятую, двоеточие или короткий дефис '-'.\n"
+            "СТРУКТУРА ОТВЕТА (соблюдай точные заголовки, каждый заголовок на отдельной строке):\n"
+            "TITLE: <короткий точный заголовок 3-7 слов без слова Обсуждение>\n"
             "SUMMARY:\n"
-            "<1-2 предложения главной сути встречи (TL;DR)>\n\n"
+            "<1-2 предложения главной сути всей встречи (TL;DR)>\n\n"
             "### Ключевые моменты\n"
-            "- <тема/факт с деталями и цифрами>\n"
+            "- **<Название темы>:** <конкретный итог, факты, решения, позиции участников>\n"
             "ACTION_ITEMS:\n"
-            "- <конкретное следующее действие и срок, если назван> (<имя ответственного, например Вы или Собеседник 1>)\n"
+            "- <конкретное действие и срок/время, если названы> (<имя ответственного, например Вы или Алексей>)\n"
             "(если реальных задач или договорённостей о действиях нет, напиши под ACTION_ITEMS только слово NONE)\n\n"
             "Пример хорошего вывода:\n"
-            "TITLE: Пресейл-обсуждение сверки ВОР и точности\n"
+            "TITLE: Сверка спецификаций ВОР и критерии точности\n"
             "SUMMARY:\n"
             "Разобрали требования к автоматической проверке спецификаций и договорились о критериях точности для старта контракта.\n\n"
             "### Ключевые моменты\n"
-            "- Входные данные: система работает с векторной базой и принимает ВОР через Excel для приведения к нужной форме.\n"
-            "- Контроль качества: целевой порог точности составляет 95% по каждому разделу на 2-3 комплектах, замер через ручную разметку и слепые тесты.\n"
+            "- **Входные данные:** система работает с векторной базой и принимает ВОР через Excel для приведения к нужной форме.\n"
+            "- **Контроль качества:** целевой порог точности составляет 95% по каждому разделу на 2-3 комплектах, замер через ручную разметку и слепые тесты.\n"
             "ACTION_ITEMS:\n"
             "- Собрать обратную связь стейкхолдеров по материалам к понедельнику (Вы)"
         )
     return (
-        "You are an expert Wispr Flow meeting notetaker. Produce a crisp, concrete, well-structured summary.\n"
+        "You are an expert Wispr Flow meeting notetaker. Produce a crisp, concrete, well-structured summary covering the ENTIRE conversation.\n"
         "LANGUAGE: Write the ENTIRE output (TITLE, SUMMARY, ACTION_ITEMS) strictly in English, "
-        "regardless of source transcript languages (keep domain/IT terms intact).\n"
-        "STYLE & PRECISION:\n"
-        "1. FORBIDDEN passive filler phrases ('Aspects were discussed...', 'Questions were raised...', 'It was noted that...'). "
+        "preserving participant names, brands, and technical terms.\n"
+        "CORE PRINCIPLES:\n"
+        "1. TITLE: 3-7 words capturing the core outcome. NEVER start TITLE with 'Discussion'.\n"
+        "2. FULL TOPIC COVERAGE: Identify EVERY distinct theme from start to finish of the meeting. "
+        "Scale the bullet count naturally to match the conversation (2-4 for a brief chat, 5-9 for a dense multi-topic call) - "
+        "do NOT artificially cap at 3-4 bullets and do NOT collapse separate themes into one vague line.\n"
+        "3. OUTCOME PER THEME: Each bullet names the topic and states the concrete conclusion, decision, win/loss outcome, disagreement, "
+        "exact numbers, deadlines, or tools. Ignore obvious ASR glitches.\n"
+        "4. STYLE: FORBIDDEN passive filler phrases ('Aspects were discussed...', 'Questions were raised...', 'Most of the time was spent...'). "
         "Write directly with active verbs.\n"
-        "2. PRESERVE concrete details: numbers, percentages, deadlines, names, tools, and technical terms.\n"
-        "3. Prioritize any highlights inside <my_thoughts>.\n"
-        "4. NEVER use long dashes (em-dash or en-dash); use commas, colons, or a short hyphen '-'.\n"
-        "FORMAT (exact headers):\n"
-        "TITLE: <short 3-6 word meeting title>\n"
+        "5. Prioritize any highlights inside <my_thoughts>.\n"
+        "6. NEVER use long dashes (em-dash or en-dash); use commas, colons, or a short hyphen '-'.\n"
+        "FORMAT (exact headers on separate lines):\n"
+        "TITLE: <short 3-7 word meeting title without 'Discussion'>\n"
         "SUMMARY:\n"
-        "<1-2 sentence TL;DR>\n\n"
+        "<1-2 sentence TL;DR of the whole meeting>\n\n"
         "### Key Points\n"
-        "- <concrete takeaway with numbers/details>\n"
+        "- **<Topic>:** <concrete outcome, facts, and positions>\n"
         "ACTION_ITEMS:\n"
-        "- <concrete task + deadline if any> (<owner, e.g. You or Speaker 1>)\n"
+        "- <concrete task + deadline if any> (<owner, e.g. You or Alex>)\n"
         "(if there are no real tasks, output ONLY NONE under ACTION_ITEMS)"
     )
 
@@ -130,7 +150,7 @@ _STOP_ACTION_PHRASES: frozenset[str] = frozenset(
 class MeetingSummarizer:
     """Summarizes short and long meeting transcripts via single-pass or Map-Reduce."""
 
-    def __init__(self, llm: TextGenerator, *, single_pass_char_limit: int = 7500) -> None:
+    def __init__(self, llm: TextGenerator, *, single_pass_char_limit: int = 4800) -> None:
         self.llm = llm
         self.single_pass_char_limit = max(2000, single_pass_char_limit)
 
@@ -232,7 +252,7 @@ class MeetingSummarizer:
         chunks: list[str] = []
         buf: list[str] = []
         buf_len = 0
-        chunk_limit = max(2000, self.single_pass_char_limit - 1200)
+        chunk_limit = max(2000, self.single_pass_char_limit - 800)
         for line in lines:
             if buf and buf_len + len(line) + 1 > chunk_limit:
                 chunks.append("\n".join(buf))
@@ -245,11 +265,21 @@ class MeetingSummarizer:
             chunks.append("\n".join(buf))
 
         total_steps = len(chunks) + 1
-        map_system = (
-            "Extract concrete facts, numbers, tools, decisions, and tasks with speaker names from this meeting segment. "
-            f"CRITICAL LANGUAGE REQUIREMENT: Write strictly in {target_lang} regardless of transcript language. "
-            "Avoid passive bureaucratic phrasing. Never use long dashes; use '-' instead."
-        )
+        if target_lang == "Russian":
+            map_system = (
+                "Извлеки ВСЕ отдельные смысловые темы из этого фрагмента разговора и подведи конкретный итог по каждой теме.\n"
+                "Правила:\n"
+                "- Пиши строго на русском языке, коротко и по сути активными глаголами (кто что сказал, решил, оспорил, выиграл/проиграл).\n"
+                "- Сохраняй реальные исходы, цифры, сроки, имена людей, названия компаний/инструментов и ключевые термины.\n"
+                "- Игнорируй явные ослышки ASR и мусорные вставки. ЗАПРЕЩЕНЫ штампы («Обсуждалось...», «Было отмечено...») и длинные тире.\n"
+                "- Формат: список строк `- <Тема>: <конкретные факты и итог>` (столько пунктов, сколько реально тем в этом фрагменте)."
+            )
+        else:
+            map_system = (
+                "Extract EVERY distinct topic from this meeting segment along with its concrete outcome, arguments, decisions, numbers, names, and tasks. "
+                f"CRITICAL LANGUAGE REQUIREMENT: Write strictly in {target_lang} regardless of transcript language. "
+                "Ignore obvious ASR glitches. Avoid passive bureaucratic phrasing. Never use long dashes; use '-' instead."
+            )
         partials: list[str] = []
         for idx, chunk in enumerate(chunks, start=1):
             if on_step is not None:
@@ -272,7 +302,7 @@ class MeetingSummarizer:
             reduce_system,
             f"<partial_notes>\n{combined}\n</partial_notes>{thoughts_block}",
             temperature=0.15,
-            max_tokens=1500,
+            max_tokens=1600,
         )
 
     @staticmethod
@@ -288,17 +318,17 @@ class MeetingSummarizer:
             if candidate:
                 title = candidate[:90]
 
-        # Split SUMMARY and ACTION_ITEMS sections
+        # Split SUMMARY and ACTION_ITEMS sections (supports same-line `SUMMARY: text` or multi-line)
         summary_text = clean
         actions_text = ""
 
-        summary_split = re.split(r"(?im)^(?:SUMMARY|РЕЗЮМЕ)\s*:\s*$", clean, maxsplit=1)
+        summary_split = re.split(r"(?im)^(?:SUMMARY|РЕЗЮМЕ)\s*:\s*", clean, maxsplit=1)
         if len(summary_split) == 2:
             after_summary = summary_split[1]
         else:
             after_summary = _SECTION_TITLE_RE.sub("", clean, count=1).strip()
 
-        action_split = re.split(r"(?im)^(?:ACTION_ITEMS|ACTION ITEMS|ЗАДАЧИ)\s*:\s*$", after_summary, maxsplit=1)
+        action_split = re.split(r"(?im)^(?:ACTION_ITEMS|ACTION ITEMS|ЗАДАЧИ)\s*:\s*", after_summary, maxsplit=1)
         if len(action_split) == 2:
             summary_text = action_split[0].strip()
             actions_text = action_split[1].strip()
@@ -325,6 +355,6 @@ class MeetingSummarizer:
 
         return SummaryResult(
             title=strip_long_dashes(title),
-            summary_md=strip_long_dashes(summary_text),
+            summary_md=format_summary_markdown(summary_text),
             action_items=action_items,
         )

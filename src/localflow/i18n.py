@@ -148,6 +148,7 @@ TRANSLATIONS: dict[LanguageCode, dict[str, str]] = {
         "notetaker.btn.popout": "Side Window",
         "notetaker.btn.regenerate": "Summarize",
         "notetaker.btn.export": "Export",
+        "notetaker.btn.copy": "Copy",
         "notetaker.btn.copy_md": "Copy Markdown",
         "notetaker.copied": "Copied!",
         "notetaker.btn.ask_ai": "Ask AI",
@@ -199,7 +200,7 @@ TRANSLATIONS: dict[LanguageCode, dict[str, str]] = {
         "notetaker.qa.ask": "Ask",
         "notetaker.qa.thinking": "Thinking...",
         "notetaker.qa.what_missed": "What did I miss?",
-        "notetaker.qa.what_missed_prompt": "Catch me up: summarize the key points, decisions, and action items discussed so far in this meeting.",
+        "notetaker.qa.what_missed_prompt": "Summarize the key takeaways for all main topics discussed so far.",
         # Insights page
         "insights.title": "Insights",
         "insights.wpm_hdr": "WORDS PER MINUTE",
@@ -547,6 +548,7 @@ TRANSLATIONS: dict[LanguageCode, dict[str, str]] = {
         "notetaker.btn.popout": "Окно сбоку",
         "notetaker.btn.regenerate": "Саммари",
         "notetaker.btn.export": "Экспорт",
+        "notetaker.btn.copy": "Копировать",
         "notetaker.btn.copy_md": "Копировать Markdown",
         "notetaker.copied": "Скопировано!",
         "notetaker.btn.ask_ai": "Ask AI",
@@ -598,7 +600,7 @@ TRANSLATIONS: dict[LanguageCode, dict[str, str]] = {
         "notetaker.qa.ask": "Спросить",
         "notetaker.qa.thinking": "Думаю...",
         "notetaker.qa.what_missed": "Что я пропустил?",
-        "notetaker.qa.what_missed_prompt": "Кратко расскажи на русском языке: какие ключевые темы, решения и задачи (action items) обсуждались до этого момента на встрече.",
+        "notetaker.qa.what_missed_prompt": "Подведи краткие промежуточные итоги по всем основным темам разговора.",
         # Insights page
         "insights.title": "Insights",
         "insights.wpm_hdr": "СЛОВ В МИНУТУ",

@@ -198,7 +198,12 @@ class NotetakerPage(QWidget):
 
         self._meeting_list = QListWidget()
         self._meeting_list.setObjectName("historyList")
-        self._meeting_list.setSpacing(4)
+        self._meeting_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._meeting_list.setWordWrap(True)
+        self._meeting_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._meeting_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self._meeting_list.setUniformItemSizes(False)
+        self._meeting_list.setSpacing(2)
         left_lay.addWidget(self._meeting_list, 1)
 
         splitter.addWidget(left)
@@ -272,6 +277,7 @@ class NotetakerPage(QWidget):
                 date_str = m.created_at[:16].replace("T", " ")
                 dur_str = format_timestamp(m.duration_sec) if m.duration_sec > 0 else "live"
                 item = QListWidgetItem(f"{m.title}\n{date_str} · {dur_str}")
+                item.setToolTip(m.title)
                 item.setData(Qt.ItemDataRole.UserRole, m.id)
                 self._meeting_list.addItem(item)
                 if m.id == target_id:
@@ -333,6 +339,7 @@ class NotetakerPage(QWidget):
                 date_str = m.created_at[:16].replace("T", " ")
                 dur_str = format_timestamp(m.duration_sec) if m.duration_sec > 0 else "live"
                 item.setText(f"{m.title}\n{date_str} · {dur_str}")
+                item.setToolTip(m.title)
 
     def _on_popout_clicked(self) -> None:
         if self._workspace.current_meeting_id is not None:

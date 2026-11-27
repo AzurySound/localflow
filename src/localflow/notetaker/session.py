@@ -70,9 +70,12 @@ class MeetingSession:
         self._stop_event = threading.Event()
         self._tracker = OnlineSpeakerTracker()
         self._utterance_embeddings: list[tuple[int, np.ndarray]] = []
+        self._remote_utterance_ids: list[int] = []
         self._recent_system: deque[tuple[float, float, str, float]] = deque(maxlen=24)
         self._last_remote_speaker_key: str = "spk_1"
         self._speaker_counter = 0
+        self._lang_votes: dict[str, int] = {}
+        self._locked_language: str | None = None
 
     @property
     def active_meeting(self) -> MeetingRecord | None:
@@ -103,8 +106,11 @@ class MeetingSession:
         self._stop_event.clear()
         self._tracker = OnlineSpeakerTracker()
         self._utterance_embeddings = []
+        self._remote_utterance_ids = []
         self._recent_system.clear()
         self._last_remote_speaker_key = "spk_1"
+        self._lang_votes.clear()
+        self._locked_language = None
         with self._cond:
             self._segments_queue.clear()
             self._pending_preview = None
@@ -210,6 +216,22 @@ class MeetingSession:
             return apply_vocabulary_replacements(text, self.vocabulary.replacements).strip()
         return text.strip()
 
+    def _transcribe_segments_safe(
+        self,
+        audio: np.ndarray,
+        *,
+        prompt: str,
+        language: str | None,
+    ) -> list[TranscriptSegment]:
+        if language is not None:
+            try:
+                return self.whisper_engine.transcribe_segments(
+                    audio, initial_prompt=prompt, language=language
+                )
+            except TypeError:
+                pass
+        return self.whisper_engine.transcribe_segments(audio, initial_prompt=prompt)
+
     def _process_segment(self, seg: AudioSegment) -> None:
         meeting = self._meeting
         if meeting is None:
@@ -218,7 +240,29 @@ class MeetingSession:
         prompt = self._build_effective_prompt()
 
         try:
-            asr_segments = self.whisper_engine.transcribe_segments(seg.audio, initial_prompt=prompt)
+            asr_segments = self._transcribe_segments_safe(
+                seg.audio, prompt=prompt, language=self._locked_language
+            )
+            if self._locked_language is None:
+                detected = getattr(self.whisper_engine, "last_detected_language", None)
+                if isinstance(detected, tuple) and len(detected) == 2:
+                    det_lang, det_prob = str(detected[0]).lower(), float(detected[1])
+                    fallback_lang = "ru" if self.lang.lower().startswith("ru") else "en"
+                    if det_lang not in {"ru", "en"} and det_prob < 0.85:
+                        logger.info(
+                            "Retrying meeting segment: unexpected language %s (p=%.2f), retrying with %s",
+                            det_lang,
+                            det_prob,
+                            fallback_lang,
+                        )
+                        asr_segments = self._transcribe_segments_safe(
+                            seg.audio, prompt=prompt, language=fallback_lang
+                        )
+                    elif det_prob >= 0.70 and sum(len(s.text.split()) for s in asr_segments) >= 3:
+                        self._lang_votes[det_lang] = self._lang_votes.get(det_lang, 0) + 1
+                        if self._lang_votes[det_lang] >= 3:
+                            self._locked_language = det_lang
+                            logger.info("Locked meeting ASR language to %s", det_lang)
         except Exception as exc:
             logger.warning("Meeting ASR failed on %s segment: %s", seg.channel, exc)
             return
@@ -253,7 +297,7 @@ class MeetingSession:
                 s1 = min(seg.audio.size, int(round(grp_end * 16000)))
                 sub_audio = seg.audio[s0:s1]
                 emb = self.embedder.embed(sub_audio) if use_diarization else None
-                allow_new = sub_audio.size >= int(16000 * 1.5)
+                allow_new = sub_audio.size >= int(16000 * 2.5)
                 if use_diarization:
                     speaker_key = self._tracker.assign(emb, allow_new_cluster=allow_new)
                 else:
@@ -275,6 +319,8 @@ class MeetingSession:
                 end_sec=abs_end,
                 text=clean_text,
             )
+            if speaker_key != "you":
+                self._remote_utterance_ids.append(utt.id)
             if emb is not None:
                 self._utterance_embeddings.append((utt.id, emb))
             if seg.channel == "system":
@@ -300,13 +346,27 @@ class MeetingSession:
         meeting = self._meeting
         if meeting is None or self._stop_event.is_set() or self.on_interim_text is None:
             return
+        if audio.size == 0:
+            spk_key = "you" if (channel == "mic" and meeting.audio_mode == "dual") else self._last_remote_speaker_key
+            self.on_interim_text(meeting.id, channel, spk_key, "")
+            return
         prompt = self._build_effective_prompt()
         text = ""
         try:
             if hasattr(self.whisper_engine, "transcribe"):
-                text = self.whisper_engine.transcribe(audio, initial_prompt=prompt)
+                if self._locked_language is not None:
+                    try:
+                        text = self.whisper_engine.transcribe(
+                            audio, initial_prompt=prompt, language=self._locked_language
+                        )
+                    except TypeError:
+                        text = self.whisper_engine.transcribe(audio, initial_prompt=prompt)
+                else:
+                    text = self.whisper_engine.transcribe(audio, initial_prompt=prompt)
             else:
-                segs = self.whisper_engine.transcribe_segments(audio, initial_prompt=prompt)
+                segs = self._transcribe_segments_safe(
+                    audio, prompt=prompt, language=self._locked_language
+                )
                 text = " ".join(s.text for s in segs if s.text)
         except Exception as exc:
             logger.debug("Meeting interim preview ASR failed: %s", exc)
@@ -391,11 +451,48 @@ class MeetingSession:
 
         if len(self._utterance_embeddings) >= 2:
             remap = refine_speaker_clusters(self._utterance_embeddings)
-            speaker_names = {
-                key: self._speaker_label_for_key(key)[0]
-                for key in set(remap.values())
+            full_remap: dict[int, str] = dict(remap)
+            last_key: str | None = None
+            for uid in self._remote_utterance_ids:
+                if uid in full_remap:
+                    last_key = full_remap[uid]
+                elif last_key is not None:
+                    full_remap[uid] = last_key
+            first_key = next((full_remap[uid] for uid in self._remote_utterance_ids if uid in full_remap), None)
+            if first_key is not None:
+                for uid in self._remote_utterance_ids:
+                    if uid not in full_remap:
+                        full_remap[uid] = first_key
+
+            # Preserve any user-assigned speaker names across post-call cluster renumbering
+            existing_speakers = {s.speaker_key: s for s in self.storage.get_speakers(meeting.id)}
+            existing_utts = {u.id: u.speaker_key for u in self.storage.get_utterances(meeting.id)}
+            custom_by_old = {
+                s.speaker_key: s.display_name.strip()
+                for s in existing_speakers.values()
+                if (
+                    not s.is_self
+                    and s.display_name.strip()
+                    and s.display_name.strip() != self._speaker_label_for_key(s.speaker_key)[0]
+                )
             }
-            self.storage.apply_speaker_remap(meeting.id, remap, speaker_names)
+            custom_votes: dict[str, dict[str, int]] = {}
+            for uid, new_key in full_remap.items():
+                old_key = existing_utts.get(uid)
+                if old_key and old_key in custom_by_old:
+                    cname = custom_by_old[old_key]
+                    bucket = custom_votes.setdefault(new_key, {})
+                    bucket[cname] = bucket.get(cname, 0) + 1
+
+            speaker_names: dict[str, str] = {}
+            for key in set(full_remap.values()):
+                if key in custom_votes:
+                    best_name = max(custom_votes[key].items(), key=lambda kv: kv[1])[0]
+                    speaker_names[key] = best_name
+                else:
+                    speaker_names[key] = self._speaker_label_for_key(key)[0]
+
+            self.storage.apply_speaker_remap(meeting.id, full_remap, speaker_names)
             if self.on_speakers_updated is not None:
                 self.on_speakers_updated(meeting.id)
 

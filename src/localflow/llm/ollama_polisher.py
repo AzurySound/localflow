@@ -615,12 +615,14 @@ class OllamaPolisher:
         max_tokens: int = 1200,
     ) -> str:
         """Run a general-purpose chat completion (for Notetaker summary & Q&A)."""
+        opts = self._build_options(num_predict=max_tokens, temperature=temperature)
+        opts["num_ctx"] = max(int(opts.get("num_ctx", self.num_ctx)), 8192)
         payload = {
             "model": self.model,
             "stream": False,
             "think": False,
             "keep_alive": self.keep_alive,
-            "options": self._build_options(num_predict=max_tokens, temperature=temperature),
+            "options": opts,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
